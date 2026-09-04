@@ -1,0 +1,10 @@
+[
+	{
+		"pkg": "@capacitor/camera",
+		"classpath": "com.capacitorjs.plugins.camera.CameraPlugin"
+	},
+	{
+		"pkg": "capacitor-document-scanner",
+		"classpath": "com.websitebeaver.capacitordocumentscanner.DocumentScannerPlugin"
+	}
+]

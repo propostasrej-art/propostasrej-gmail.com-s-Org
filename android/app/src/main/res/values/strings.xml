@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Analista de Cadastro R&amp;J</string>
+    <string name="title_activity_main">Analista de Cadastro R&amp;J</string>
+    <string name="package_name">com.rj.analista</string>
+    <string name="custom_url_scheme">com.rj.analista</string>
+</resources>

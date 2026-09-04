@@ -1,0 +1,148 @@
+{
+  "entities": {
+    "Entrada": {
+      "title": "Entrada",
+      "description": "Documento de entrada extraído e processado",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "property": {
+          "type": "object",
+          "properties": {
+            "empreendimento": { "type": "string" },
+            "unidade": { "type": "string" },
+            "torre": { "type": "string" }
+          }
+        },
+        "sales_team": {
+          "type": "object",
+          "properties": {
+            "corretor1": { "type": "string" },
+            "corretor2": { "type": "string" },
+            "gerente": { "type": "string" }
+          }
+        },
+        "customers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "nome": { "type": "string" },
+              "cpf": { "type": "string" },
+              "telefone": { "type": "string" },
+              "email": { "type": "string" }
+            }
+          }
+        },
+        "address": {
+          "type": "object",
+          "properties": {
+            "cep": { "type": "string" },
+            "logradouro": { "type": "string" },
+            "numero": { "type": "string" },
+            "cidade": { "type": "string" },
+            "estado": { "type": "string" }
+          }
+        },
+        "valorTotalProposta": { "type": "number" },
+        "valorEntrada": { "type": "number" },
+        "spreadsheet_id": { "type": "string" },
+        "drive_link": { "type": "string" },
+        "status": { "type": "string", "enum": ["na fila", "devolvida com pendencia", "contrato enviado"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "uid": { "type": "string", "description": "ID do usuário que criou a entrada" }
+      },
+      "required": ["property", "customers", "valorTotalProposta", "status", "created_at", "uid"]
+    },
+    "Inbox": {
+      "title": "Inbox",
+      "description": "Documentos recebidos via AppSheet ou Webhook aguardando processamento",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "fileName": { "type": "string" },
+        "fileUrl": { "type": "string" },
+        "source": { "type": "string", "description": "Origem do documento (ex: AppSheet)" },
+        "status": { "type": "string", "enum": ["pendente", "processado", "erro"] },
+        "metadata": { "type": "object" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["fileUrl", "status", "created_at"]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "Configurações personalizadas do usuário",
+      "type": "object",
+      "properties": {
+        "dashboard_spreadsheet_id": { "type": "string" }
+      }
+    },
+    "Empreendimento": {
+      "title": "Empreendimento",
+      "description": "Cadastro de empreendimentos imobiliários",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "nome": { "type": "string" },
+        "construtora": { "type": "string" },
+        "localizacao": { "type": "string" },
+        "tabela_base_id": { "type": "string" },
+        "status": { "type": "string", "enum": ["ATIVO", "INATIVO"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "uid": { "type": "string" }
+      },
+      "required": ["nome", "status", "created_at", "uid"]
+    },
+    "InstallmentConfig": {
+      "title": "InstallmentConfig",
+      "description": "Configuração de periodicidade e descrição de parcelas",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "descricao": { "type": "string" },
+        "periodicidade": { "type": "number", "description": "Periodicidade em meses" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "uid": { "type": "string" }
+      },
+      "required": ["descricao", "periodicidade", "created_at", "uid"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Dados de perfil e permissões do usuário",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["admin", "user", "EV"] }
+      },
+      "required": ["role"]
+    }
+  },
+  "firestore": {
+    "users": {
+        "schema": "User",
+        "description": "Coleção de perfis de usuários e seus papéis"
+    },
+    "entrada": {
+      "schema": "Entrada",
+      "description": "Coleção de entradas extraídas"
+    },
+    "inbox": {
+      "schema": "Inbox",
+      "description": "Fila de entrada de documentos pendentes"
+    },
+    "user_settings": {
+      "schema": "UserSettings",
+      "description": "Configurações personalizadas do usuário"
+    },
+    "empreendimentos": {
+      "schema": "Empreendimento",
+      "description": "Cadastro de empreendimentos"
+    },
+    "configuracoes_parcelas": {
+      "schema": "InstallmentConfig",
+      "description": "Configurações de periodicidade de parcelas"
+    }
+  }
+}
