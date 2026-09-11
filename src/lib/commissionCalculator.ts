@@ -1,11 +1,45 @@
 import { PaymentInstallment, RegraComissao, InstallmentTypeConfig } from "../types";
 
+export interface CondicaoPagamentoItem {
+  quantidade: number;
+  tipo: string;
+  valorUnitario: number;
+  vencimento: string;
+  vencimentoFinal: string;
+  valorTotal: number;
+}
+
 export interface CommissionResult {
   comissaoTotal: number;
   fluxo: Array<PaymentInstallment & { tipo_fluxo: 'PROTEGIDA' | 'ELEGÍVEL', valorLiquido: number }>;
   fluxoConsolidado: Array<PaymentInstallment & { tipo_fluxo: 'PROTEGIDA' | 'ELEGÍVEL', valorLiquido: number }>;
   saldoComissaoRestante: number;
   isViavel: boolean;
+  condicaoPreco: CondicaoPagamentoItem[];
+  condicaoComissao: CondicaoPagamentoItem[];
+}
+
+/**
+ * Verifica se uma parcela deve ser excluída da base de cálculo das comissões.
+ * Conforme regra de negócio: parcelas dos tipos "Bonus Repasse", "Bônus Adimplimento"
+ * e "Inadimplemento" não integram a base de cálculo de comissões.
+ */
+export function isExcludedFromCommissionBase(tipo?: string): boolean {
+  if (!tipo || typeof tipo !== 'string') return false;
+  const norm = tipo
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+
+  // Bônus Repasse ("bonus repasse", "repasse de bonus", etc.)
+  if (norm.includes('bonus') && norm.includes('repasse')) return true;
+  if (norm.includes('bonus repasse') || norm.includes('repasse bonus')) return true;
+
+  // Bônus Adimplimento / Adimplimento / Inadimplemento ("bonus adimplimento", "adimplimento", "inadimplemento", etc.)
+  if (norm.includes('adimpl') || norm.includes('inadimpl')) return true;
+
+  return false;
 }
 
 export function processarProposta(
@@ -16,11 +50,11 @@ export function processarProposta(
   formaPagamento?: string
 ): CommissionResult {
   const percentual = percentualComissao / 100;
-  const protegidasBase = ["financiamento", "fgts", "subsídio", "bancário", "instituição", "inadimplemento"];
+  const protegidasBase = ["financiamento", "fgts", "subsídio", "bancário", "instituição", "inadimplemento", "bonus repasse", "adimplimento"];
   
-  // 1. Cálculo da Comissão Total - Excludes 'INADIMPLIMENTO' from the basis for commission calculation
+  // 1. Cálculo da Comissão Total - Parcelas do tipo Bonus Repasse e Bônus Adimplimento/Inadimplemento não integram a base de cálculo
   const valorVenda = parcelas
-    .filter(p => !(p.tipo || '').toLowerCase().includes('inadimplemento'))
+    .filter(p => !isExcludedFromCommissionBase(p.tipo))
     .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
   const comissaoTotal = valorVenda * percentual;
   
@@ -160,7 +194,7 @@ export function processarProposta(
         valorLiquido = valorOriginal - deducaoEfetiva;
         saldoComissao -= deducaoEfetiva;
       }
-    } else if (protegidasBase.some(ref => nomeClean.includes(ref))) {
+    } else if (protegidasBase.some(ref => nomeClean.includes(ref)) || isExcludedFromCommissionBase(nomeClean)) {
       tipoFluxo = "PROTEGIDA";
       valorLiquido = valorOriginal;
     } else {
@@ -197,11 +231,80 @@ export function processarProposta(
     };
   });
 
+  const condicaoPreco = extrairCondicaoPagamentoDoFluxo(fluxo, 'preco');
+  const condicaoComissao = extrairCondicaoPagamentoDoFluxo(fluxo, 'comissao');
+
   return {
     comissaoTotal,
     fluxo,
     fluxoConsolidado,
     saldoComissaoRestante: saldoComissao,
-    isViavel: saldoComissao <= 0.01
+    isViavel: saldoComissao <= 0.01,
+    condicaoPreco,
+    condicaoComissao
   };
+}
+
+/**
+ * Agrupa as parcelas do fluxo cronológico detalhado gerando a Condição de Pagamento
+ * (seja do Preço/Líquido ou das Comissões) com prazos, quantidades e valores reais.
+ */
+export function extrairCondicaoPagamentoDoFluxo(
+  fluxo: Array<{
+    tipo: string;
+    vencimento: string;
+    valorTotal: number;
+    valorLiquido: number;
+  }>,
+  campo: 'preco' | 'comissao'
+): CondicaoPagamentoItem[] {
+  if (!fluxo || fluxo.length === 0) return [];
+
+  const parcelasValidas = fluxo
+    .map(p => {
+      const valor = campo === 'preco'
+        ? Number((p.valorLiquido || 0).toFixed(2))
+        : Number(Math.max(0, (p.valorTotal || 0) - (p.valorLiquido || 0)).toFixed(2));
+      return {
+        tipo: p.tipo,
+        vencimento: p.vencimento || '',
+        valor
+      };
+    })
+    .filter(p => p.valor > 0.005);
+
+  if (parcelasValidas.length === 0) return [];
+
+  const grupos: CondicaoPagamentoItem[] = [];
+  let grupoAtual: CondicaoPagamentoItem | null = null;
+
+  for (const item of parcelasValidas) {
+    if (
+      grupoAtual &&
+      grupoAtual.tipo.trim().toLowerCase() === item.tipo.trim().toLowerCase() &&
+      Math.abs(grupoAtual.valorUnitario - item.valor) < 0.01
+    ) {
+      grupoAtual.quantidade += 1;
+      grupoAtual.vencimentoFinal = item.vencimento;
+      grupoAtual.valorTotal = Number((grupoAtual.valorTotal + item.valor).toFixed(2));
+    } else {
+      if (grupoAtual) {
+        grupos.push(grupoAtual);
+      }
+      grupoAtual = {
+        quantidade: 1,
+        tipo: item.tipo,
+        valorUnitario: item.valor,
+        vencimento: item.vencimento,
+        vencimentoFinal: item.vencimento,
+        valorTotal: item.valor
+      };
+    }
+  }
+
+  if (grupoAtual) {
+    grupos.push(grupoAtual);
+  }
+
+  return grupos;
 }

@@ -1,4 +1,5 @@
 import { PaymentInstallment } from "../types";
+import { isExcludedFromCommissionBase } from "./commissionCalculator";
 
 export interface WaterfallParticipant {
   role: string;
@@ -26,6 +27,12 @@ export interface WaterfallResult {
   participantes: WaterfallParticipant[];
   detalhesParcelas: WaterfallInstallmentResult[];
   saldoRestanteComissao: number;
+}
+
+export function isImobiliariaRole(role: string): boolean {
+  if (!role) return false;
+  const normalized = role.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+  return normalized.includes('imobiliaria');
 }
 
 export function calcularRateioCascata(
@@ -64,9 +71,9 @@ export function calcularRateioCascata(
         participantes.push({
           role: p.role,
           name: name,
-          percentage: p.percentage,
-          percentageOnInstallment: p.deduction ?? 0,
-          deduction: p.deduction ?? 0,
+          percentage: percentageIndividual,
+          percentageOnInstallment: percentageOnInstallmentIndividual,
+          deduction: percentageOnInstallmentIndividual,
           cap: capIndividual,
           received: 0,
           balance: capIndividual,
@@ -130,13 +137,13 @@ export function calcularRateioCascata(
   }
 
   // Processar Parcelas em Ordem Cronológica (Dedução realística baseada no teto e percentual sobre parcelas)
-  const protegidasBase = ["financiamento", "fgts", "subsídio", "bancário", "instituição", "inadimplemento"];
+  const protegidasBase = ["financiamento", "fgts", "subsídio", "bancário", "instituição", "inadimplemento", "bonus repasse", "adimplimento"];
 
   fluxoPagamentos.forEach(parcela => {
     const tipo = (parcela.tipo || "").toLowerCase();
     
-    // Ignorar parcelas de inadimplemento
-    if (tipo.includes('inadimplemento')) {
+    // Ignorar parcelas que não integram a base de comissão (Bônus Repasse, Bônus Adimplimento, Inadimplemento)
+    if (isExcludedFromCommissionBase(tipo)) {
       detalhesParcelas.push({
         vencimento: parcela.vencimento,
         tipo: parcela.tipo,
@@ -163,7 +170,7 @@ export function calcularRateioCascata(
 
     // Calcular o teto de dedução da parcela (T)
     let tetoParcela = valorParcela; // Default: 100%
-    if (protegidasBase.some(ref => tipo.includes(ref))) {
+    if (protegidasBase.some(ref => tipo.includes(ref)) || isExcludedFromCommissionBase(tipo)) {
       tetoParcela = 0; // Protegida: 0%
     } else if (regrasComissao) {
       const regraMatch = regrasComissao.find(r => r.parcela && tipo.includes(r.parcela.toLowerCase()));
@@ -306,13 +313,15 @@ export function calcularRateioCascata(
     });
   });
 
-  return {
+  const resultadoBruto: WaterfallResult = {
     vendaTotal,
     comissaoTotal,
     participantes,
     detalhesParcelas,
     saldoRestanteComissao: Number(saldoDevedorGlobal.toFixed(2))
   };
+
+  return obterRateioConsolidado(resultadoBruto) || resultadoBruto;
 }
 
 export function obterRateioConsolidado(waterfall: WaterfallResult | null): WaterfallResult | null {
@@ -323,15 +332,22 @@ export function obterRateioConsolidado(waterfall: WaterfallResult | null): Water
   if (!hasHidden) return waterfall;
 
   // Find the Imobiliária participant
-  const imobiliariaIndex = waterfall.participantes.findIndex(p => 
-    p.role.toLowerCase().trim() === 'imobiliária' || 
-    p.role.toLowerCase().trim() === 'imobiliaria'
-  );
+  const imobiliariaIndex = waterfall.participantes.findIndex(p => isImobiliariaRole(p.role));
 
-  // If there's no Imobiliária participant, we can't sum into it, so we return the original
-  if (imobiliariaIndex === -1) return waterfall;
+  const originalImobiliaria: WaterfallParticipant = imobiliariaIndex !== -1 
+    ? waterfall.participantes[imobiliariaIndex]
+    : {
+        role: 'Imobiliária',
+        name: '',
+        percentage: 0,
+        percentageOnInstallment: 0,
+        deduction: 0,
+        cap: 0,
+        received: 0,
+        balance: 0,
+        hideAndSum: false
+      };
 
-  const originalImobiliaria = waterfall.participantes[imobiliariaIndex];
   const imobiliariaLabel = originalImobiliaria.name 
     ? `${originalImobiliaria.role} - ${originalImobiliaria.name}` 
     : originalImobiliaria.role;
@@ -346,15 +362,15 @@ export function obterRateioConsolidado(waterfall: WaterfallResult | null): Water
   let extraPercentage = 0;
 
   waterfall.participantes.forEach((p, idx) => {
-    if (idx === imobiliariaIndex) {
+    if (imobiliariaIndex !== -1 && idx === imobiliariaIndex) {
       // We will add the accumulated values later
       return;
     }
     if (p.hideAndSum) {
-      extraCap += p.cap;
-      extraReceived += p.received;
-      extraBalance += p.balance;
-      extraPercentage += p.percentage;
+      extraCap = Number((extraCap + p.cap).toFixed(2));
+      extraReceived = Number((extraReceived + p.received).toFixed(2));
+      extraBalance = Number((extraBalance + p.balance).toFixed(2));
+      extraPercentage = Number((extraPercentage + p.percentage).toFixed(2));
     } else {
       novosParticipantes.push({ ...p });
     }
@@ -367,23 +383,30 @@ export function obterRateioConsolidado(waterfall: WaterfallResult | null): Water
     received: Number((originalImobiliaria.received + extraReceived).toFixed(2)),
     balance: Number((originalImobiliaria.balance + extraBalance).toFixed(2)),
     percentage: Number((originalImobiliaria.percentage + extraPercentage).toFixed(2)),
+    hideAndSum: false
   };
 
   // Insert Imobiliária back at its relative index
-  let newImobiliariaIndex = imobiliariaIndex;
-  for (let i = 0; i < imobiliariaIndex; i++) {
-    if (waterfall.participantes[i].hideAndSum) {
-      newImobiliariaIndex--;
+  if (imobiliariaIndex !== -1) {
+    let newImobiliariaIndex = imobiliariaIndex;
+    for (let i = 0; i < imobiliariaIndex; i++) {
+      if (waterfall.participantes[i].hideAndSum) {
+        newImobiliariaIndex--;
+      }
     }
+    novosParticipantes.splice(Math.max(0, newImobiliariaIndex), 0, novaImobiliaria);
+  } else {
+    // If there was no Imobiliária participant, add at the beginning
+    novosParticipantes.unshift(novaImobiliaria);
   }
-  novosParticipantes.splice(newImobiliariaIndex, 0, novaImobiliaria);
 
-  // Map detalhesParcelas
+  // Map detalhesParcelas to remove hidden roles and group their amounts into Imobiliária
   const novosDetalhesParcelas = waterfall.detalhesParcelas.map(det => {
     const novaDistribuicao: { [label: string]: number } = {};
     let extraDistValue = 0;
 
-    Object.entries(det.distribuicao).forEach(([label, value]) => {
+    Object.entries(det.distribuicao || {}).forEach(([label, value]) => {
+      const valNum = Number(value) || 0;
       const part = waterfall.participantes.find(p => {
         const pLabel = p.name ? `${p.role} - ${p.name}` : p.role;
         return pLabel === label;
@@ -391,21 +414,21 @@ export function obterRateioConsolidado(waterfall: WaterfallResult | null): Water
 
       if (part) {
         if (part.hideAndSum) {
-          extraDistValue += value;
-        } else if (part.role.toLowerCase().trim() !== 'imobiliária' && part.role.toLowerCase().trim() !== 'imobiliaria') {
-          novaDistribuicao[label] = value;
+          extraDistValue = Number((extraDistValue + valNum).toFixed(2));
+        } else if (!isImobiliariaRole(part.role)) {
+          novaDistribuicao[label] = valNum;
         }
       } else {
-        novaDistribuicao[label] = value;
+        if (label !== imobiliariaLabel) {
+          novaDistribuicao[label] = valNum;
+        }
       }
     });
 
-    const originalImobiliariaValueReal = det.distribuicao[imobiliariaLabel] || 0;
+    const originalImobiliariaValueReal = Number(det.distribuicao?.[imobiliariaLabel]) || 0;
     const finalImobiliariaValue = Number((originalImobiliariaValueReal + extraDistValue).toFixed(2));
     
-    if (finalImobiliariaValue > 0 || originalImobiliariaValueReal > 0) {
-      novaDistribuicao[imobiliariaLabel] = finalImobiliariaValue;
-    }
+    novaDistribuicao[imobiliariaLabel] = finalImobiliariaValue;
 
     return {
       ...det,
