@@ -21,12 +21,18 @@ export interface PropertyData {
   empreendimento: string;
   unidade: string;
   torre: string;
+  cidade?: string;
+  estado?: string;
+  localizacao?: string;
+  endereco?: string;
 }
 
 export interface SalesTeam {
   corretor1: string;
   corretor2: string;
   gerente: string;
+  diretor?: string;
+  coordenador?: string;
 }
 
 export interface CustomerData {
@@ -158,6 +164,7 @@ export interface Empreendimento {
   nome: string;
   construtora?: string;
   localizacao?: string;
+  endereco?: string;
   tabela_base_id?: string; // ID da planilha no Sheets se houver
   status: 'ATIVO' | 'INATIVO';
   regras_comissao?: RegraComissao[];
@@ -189,6 +196,9 @@ export const EXTRACTION_SCHEMA = {
         empreendimento: { type: Type.STRING },
         unidade: { type: Type.STRING },
         torre: { type: Type.STRING },
+        cidade: { type: Type.STRING },
+        estado: { type: Type.STRING },
+        endereco: { type: Type.STRING },
       },
       required: ["empreendimento", "unidade"],
     },

@@ -7,7 +7,7 @@ import cookieParser from "cookie-parser";
 import multer from "multer";
 import { Readable } from "stream";
 import axios from "axios";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { AssinafyClient } from "@assinafy/sdk";
 import fs from "fs";
 
@@ -52,10 +52,21 @@ const responseToBuffer = async (data: any): Promise<Buffer> => {
   return Buffer.from(String(data));
 };
 
-const getOAuth2Client = (requestHost?: string) => {
-  const clientId = process.env.GOOGLE_CLIENT_ID || "703745353676-nqorfif2gmqe7pathgfpfjvos8mio1bb.apps.googleusercontent.com";
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET || "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";
+const getOAuth2Client = (reqOrHost?: any, explicitRedirectUri?: string) => {
+  const clientId = process.env.GOOGLE_CLIENT_ID || "675095875960-lgiit33brqq2tumt3k0mt78ee06bf1tu.apps.googleusercontent.com";
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET || "";
   
+  if (explicitRedirectUri) {
+    return new google.auth.OAuth2(clientId, clientSecret, explicitRedirectUri);
+  }
+
+  let requestHost = "";
+  if (typeof reqOrHost === "string") {
+    requestHost = reqOrHost;
+  } else if (reqOrHost && typeof reqOrHost === "object") {
+    requestHost = (reqOrHost.headers?.["x-forwarded-host"] as string) || reqOrHost.headers?.host || "";
+  }
+
   let appUrl = "";
   if (requestHost && (requestHost.includes("run.app") || !requestHost.includes("localhost"))) {
     appUrl = `https://${requestHost}`;
@@ -69,8 +80,60 @@ const getOAuth2Client = (requestHost?: string) => {
   appUrl = appUrl.replace(/\/$/, "");
   const redirectUri = `${appUrl}/api/auth/google/callback`;
 
-  console.log(`[OAuth] Inicializando cliente com Redirect URI: ${redirectUri}`);
   return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+};
+
+// In-memory token storage for environments where iframe blocks third-party cookies
+let inMemoryGoogleTokens: any = null;
+
+const extractGoogleTokens = (req: any): any | null => {
+  if (!req) return inMemoryGoogleTokens;
+
+  // 1. Check Authorization header (Bearer <access_token> or Bearer <json>)
+  const authHeader = req.headers?.authorization;
+  if (authHeader && typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+    const raw = authHeader.substring(7).trim();
+    if (raw.startsWith("{")) {
+      try { return JSON.parse(raw); } catch (e) {}
+    } else if (raw) {
+      return { access_token: raw };
+    }
+  }
+
+  // 2. Check x-google-tokens header (custom header sent by frontend)
+  const customHeader = req.headers?.["x-google-tokens"];
+  if (typeof customHeader === "string" && customHeader.trim()) {
+    try {
+      const parsed = JSON.parse(customHeader);
+      if (parsed && (parsed.access_token || parsed.refresh_token)) {
+        return parsed;
+      }
+    } catch (e) {}
+  }
+
+  // 3. Check request body
+  if (req.body?.google_tokens) {
+    if (typeof req.body.google_tokens === "object") return req.body.google_tokens;
+    try { return JSON.parse(req.body.google_tokens); } catch (e) {}
+  }
+
+  // 4. Check cookies
+  const cookieStr = req.cookies?.google_tokens;
+  if (cookieStr) {
+    try {
+      const parsed = typeof cookieStr === "object" ? cookieStr : JSON.parse(cookieStr);
+      if (parsed && (parsed.access_token || parsed.refresh_token)) {
+        return parsed;
+      }
+    } catch (e) {}
+  }
+
+  // 5. Fallback to active in-memory tokens
+  if (inMemoryGoogleTokens) {
+    return inMemoryGoogleTokens;
+  }
+
+  return null;
 };
 
 const isGoogleAuthError = (error: any) => {
@@ -120,26 +183,37 @@ const isApiDisabledError = (error: any) => {
          dataStr.includes("enable it by visiting");
 };
 
-const setCredentialsAndListen = (auth: any, tokens: any, res: any) => {
+const setCredentialsAndListen = (auth: any, tokens: any, res?: any) => {
   auth.setCredentials(tokens);
+  inMemoryGoogleTokens = tokens;
   auth.on("tokens", (newTokens: any) => {
-    console.log("[OAuth] Token auto-refreshed, saving updated credentials back to 'google_tokens' cookie.");
+    console.log("[OAuth] Token auto-refreshed, updating in-memory & cookie credentials.");
     const mergedTokens = { ...tokens, ...newTokens };
-    res.cookie("google_tokens", JSON.stringify(mergedTokens), {
-      httpOnly: true,
-      secure: true,
-      sameSite: "none",
-      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-    });
+    inMemoryGoogleTokens = mergedTokens;
+    if (res && res.cookie) {
+      try {
+        res.cookie("google_tokens", JSON.stringify(mergedTokens), {
+          httpOnly: true,
+          secure: true,
+          sameSite: "none",
+          maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+        });
+      } catch (e) {}
+    }
   });
 };
 
-const clearGoogleTokensCookie = (res: any) => {
-  res.clearCookie("google_tokens", {
-    httpOnly: true,
-    secure: true,
-    sameSite: "none",
-  });
+const clearGoogleTokensCookie = (res?: any) => {
+  inMemoryGoogleTokens = null;
+  if (res && res.clearCookie) {
+    try {
+      res.clearCookie("google_tokens", {
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+      });
+    } catch (e) {}
+  }
 };
 
 async function startServer() {
@@ -164,11 +238,31 @@ async function startServer() {
   });
 
   // Google Auth Routes
+  app.get("/api/auth/google/login", (req, res) => {
+    const client = getOAuth2Client(req.headers.host);
+    const url = client.generateAuthUrl({
+      access_type: "offline",
+      scope: [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/gmail.send",
+      ],
+      prompt: "consent",
+    });
+    res.redirect(url);
+  });
+
   app.get("/api/auth/google/url", (req, res) => {
     const client = getOAuth2Client(req.headers.host);
     const url = client.generateAuthUrl({
       access_type: "offline",
       scope: [
+        "openid",
+        "email",
+        "profile",
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.file",
         "https://www.googleapis.com/auth/gmail.send",
@@ -176,6 +270,58 @@ async function startServer() {
       prompt: "consent",
     });
     res.json({ url });
+  });
+
+  app.get("/api/auth/google/tokens", (req, res) => {
+    const tokens = extractGoogleTokens(req);
+    if (tokens) {
+      return res.json({ success: true, tokens });
+    }
+    res.status(404).json({ success: false, error: "Nenhum token encontrado" });
+  });
+
+  app.get("/api/auth/google/user-info", async (req, res) => {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens?.access_token) {
+      return res.status(401).json({ error: "Não autenticado" });
+    }
+    try {
+      const auth = getOAuth2Client(req.headers.host);
+      auth.setCredentials(tokens);
+      const oauth2 = google.oauth2({ version: 'v2', auth });
+      const { data } = await oauth2.userinfo.get();
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/auth/google/refresh", async (req, res) => {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
+      return res.status(401).json({ error: "Nenhum token fornecido", reauth: true });
+    }
+    if (!tokens.refresh_token) {
+      return res.status(401).json({ error: "Nenhum refresh token disponível", reauth: true });
+    }
+    try {
+      const auth = getOAuth2Client(req.headers.host);
+      auth.setCredentials(tokens);
+      const refreshResult = await auth.refreshAccessToken();
+      const credentials = refreshResult.credentials || refreshResult;
+      const mergedTokens = { ...tokens, ...credentials };
+      inMemoryGoogleTokens = mergedTokens;
+      res.cookie("google_tokens", JSON.stringify(mergedTokens), {
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        maxAge: 30 * 24 * 60 * 60 * 1000,
+      });
+      return res.json({ success: true, tokens: mergedTokens });
+    } catch (e: any) {
+      console.error("[OAuth] Erro ao renovar token de acesso:", e);
+      return res.status(401).json({ error: "Sessão expirada. Reautenticação necessária.", reauth: true });
+    }
   });
 
   const isInsufficientPermissionError = (error: any) => {
@@ -196,64 +342,196 @@ async function startServer() {
            dataStr.includes("insufficient authentication scopes");
   };
 
+  app.post("/api/auth/google/store-tokens", (req, res) => {
+    const { tokens } = req.body;
+    if (tokens) {
+      inMemoryGoogleTokens = tokens;
+      try {
+        res.cookie("google_tokens", JSON.stringify(tokens), {
+          httpOnly: true,
+          secure: true,
+          sameSite: "none",
+          maxAge: 30 * 24 * 60 * 60 * 1000,
+        });
+      } catch (e) {}
+      return res.json({ success: true, message: "Tokens armazenados com sucesso" });
+    }
+    res.status(400).json({ error: "Nenhum token fornecido" });
+  });
+
   app.get("/api/auth/google/callback", async (req, res) => {
-    const { code } = req.query;
+    const { code, error: authQueryError, error_description } = req.query;
+
+    if (authQueryError) {
+      console.warn(`[OAuth Callback] Google returned error: ${authQueryError} - ${error_description}`);
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Erro de Autenticação</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f8fafc; color: #0f172a; text-align: center; }
+              .card { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); max-width: 440px; width: 90%; }
+              .error-icon { width: 44px; height: 44px; background: #fee2e2; color: #dc2626; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.25rem; font-size: 20px; font-weight: bold; }
+              button { background: #4f46e5; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; margin-top: 1rem; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <div class="error-icon">✕</div>
+              <h2 style="margin: 0 0 0.5rem; font-size: 1.25rem; font-weight: 700; color: #991b1b;">Não foi possível concluir a autenticação</h2>
+              <p style="color: #64748b; font-size: 0.875rem; line-height: 1.5; margin: 0 0 1rem;">
+                ${error_description || "A autorização foi cancelada ou recusada pelo Google. Se você estiver usando autenticação em 2 etapas, certifique-se de autorizar os acessos solicitados."}
+              </p>
+              <button onclick="window.close()">Fechar janela e tentar novamente</button>
+            </div>
+          </body>
+        </html>
+      `);
+    }
+
+    if (!code) {
+      return res.status(400).send("Código de autorização não encontrado.");
+    }
+
     try {
-      const client = getOAuth2Client(req.headers.host);
-      const { tokens } = await client.getToken(code as string);
-      
-      // Merge with existing cookies to stay robust and not lose refresh token
-      let mergedTokens = tokens;
-      const existingCookie = req.cookies.google_tokens;
-      if (existingCookie) {
+      // Candidate redirect URIs in order of priority
+      const candidateHosts = [
+        req.headers.host,
+        process.env.APP_URL ? new URL(process.env.APP_URL).host : null,
+        "ais-dev-mnko3fredg5cl6fz5xbf3b-366038558643.us-east1.run.app",
+        "ais-pre-mnko3fredg5cl6fz5xbf3b-366038558643.us-east1.run.app"
+      ].filter(Boolean) as string[];
+
+      const uniqueCandidateHosts = Array.from(new Set(candidateHosts));
+
+      let tokens: any = null;
+      let lastError: any = null;
+
+      for (const host of uniqueCandidateHosts) {
         try {
-          const oldTokens = JSON.parse(existingCookie);
-          mergedTokens = { ...oldTokens, ...tokens };
-        } catch (e) {
-          console.error("[OAuth Callback] Error parsing existing tokens cookie:", e);
+          const client = getOAuth2Client(host);
+          const exchangeResult = await client.getToken(code as string);
+          if (exchangeResult?.tokens) {
+            tokens = exchangeResult.tokens;
+            console.log(`[OAuth Callback] Sucesso ao trocar token usando host: ${host}`);
+            break;
+          }
+        } catch (err: any) {
+          lastError = err;
+          const msg = (err.message || "").toLowerCase();
+          if (!msg.includes("redirect_uri_mismatch")) {
+            // If it is invalid_grant (e.g. code already used or expired), breaking early
+            break;
+          }
         }
       }
 
-      // Store tokens in a secure, cross-origin cookie
-      res.cookie("google_tokens", JSON.stringify(mergedTokens), {
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
-        maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-      });
+      if (!tokens) {
+        throw lastError || new Error("Falha ao obter tokens de autenticação.");
+      }
+      
+      // Merge with existing tokens to stay robust and not lose refresh token
+      let mergedTokens = tokens;
+      const existingTokens = extractGoogleTokens(req);
+      if (existingTokens) {
+        mergedTokens = { ...existingTokens, ...tokens };
+      }
+      inMemoryGoogleTokens = mergedTokens;
+
+      // Store tokens in cookie if supported
+      try {
+        res.cookie("google_tokens", JSON.stringify(mergedTokens), {
+          httpOnly: true,
+          secure: true,
+          sameSite: "none",
+          maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+        });
+      } catch (e) {}
+
+      const tokensJson = JSON.stringify(mergedTokens).replace(/</g, '\\u003c');
 
       res.send(`
+        <!DOCTYPE html>
         <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Autenticação Google Concluída</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f8fafc; color: #0f172a; text-align: center; }
+              .card { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); max-width: 400px; width: 90%; }
+              .spinner { width: 36px; height: 36px; border: 3px solid #e2e8f0; border-top-color: #4f46e5; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 1.25rem; }
+              @keyframes spin { to { transform: rotate(360deg); } }
+            </style>
+          </head>
           <body>
+            <div class="card">
+              <div class="spinner"></div>
+              <h2 style="margin: 0 0 0.5rem; font-size: 1.25rem; font-weight: 700;">Autenticado com sucesso!</h2>
+              <p style="color: #64748b; font-size: 0.875rem; margin: 0 0 1rem;">Sincronizando com a aplicação...</p>
+              <button onclick="window.close()" style="background: #4f46e5; color: white; border: none; padding: 0.5rem 1rem; border-radius: 0.5rem; font-size: 0.875rem; cursor: pointer;">Fechar esta janela</button>
+            </div>
             <script>
-              if (window.opener) {
-                window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS' }, '*');
-                window.close();
+              const tokens = ${tokensJson};
+              try {
+                localStorage.setItem('rj_google_tokens', JSON.stringify(tokens));
+                localStorage.setItem('rj_auth_timestamp', Date.now().toString());
+              } catch (e) {}
+
+              // Notify opener window if available
+              if (window.opener && !window.opener.closed) {
+                try {
+                  window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', tokens: tokens }, '*');
+                } catch (e) {}
+                setTimeout(() => {
+                  try { window.close(); } catch(e) {}
+                }, 1200);
               } else {
-                window.location.href = '/';
+                setTimeout(() => {
+                  window.location.href = '/';
+                }, 1500);
               }
             </script>
-            <p>Autenticação concluída com sucesso! Esta janela fechará automaticamente.</p>
           </body>
         </html>
       `);
     } catch (error: any) {
-      if (isGoogleAuthError(error)) {
-        console.warn("Google token exchange warning (code already used or expired).");
-      } else {
-        console.error("Error exchanging code:", error);
-      }
-      res.status(500).send("Erro na autenticação com o Google.");
+      console.error("[OAuth Callback Error]:", error);
+      res.status(500).send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Erro de Troca de Credenciais</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f8fafc; color: #0f172a; text-align: center; }
+              .card { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); max-width: 440px; width: 90%; }
+              .error-icon { width: 44px; height: 44px; background: #fee2e2; color: #dc2626; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.25rem; font-size: 20px; font-weight: bold; }
+              button { background: #4f46e5; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; margin-top: 1rem; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <div class="error-icon">✕</div>
+              <h2 style="margin: 0 0 0.5rem; font-size: 1.25rem; font-weight: 700; color: #991b1b;">Erro ao trocar credencial</h2>
+              <p style="color: #64748b; font-size: 0.875rem; line-height: 1.5; margin: 0 0 1rem;">
+                O código de autenticação expirou ou já foi utilizado. Por favor, feche esta janela e tente conectar novamente.
+              </p>
+              <button onclick="window.close()">Fechar janela</button>
+            </div>
+          </body>
+        </html>
+      `);
     }
   });
 
   app.get("/api/auth/google/status", async (req, res) => {
-    const tokensStr = req.cookies.google_tokens;
-    if (!tokensStr) {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
       return res.json({ isAuthenticated: false });
     }
     try {
-      const tokens = JSON.parse(tokensStr);
       const auth = getOAuth2Client(req.headers.host);
       setCredentialsAndListen(auth, tokens, res);
       
@@ -262,7 +540,7 @@ async function startServer() {
         clearGoogleTokensCookie(res);
         return res.json({ isAuthenticated: false });
       }
-      res.json({ isAuthenticated: true });
+      res.json({ isAuthenticated: true, tokens });
     } catch (error: any) {
       if (isGoogleAuthError(error)) {
         console.warn("[OAuth Status Check] Google tokens are expired or invalid (user needs to re-authenticate).");
@@ -280,15 +558,14 @@ async function startServer() {
   });
 
   app.post("/api/export/sheets", async (req, res) => {
-    const tokensStr = req.cookies.google_tokens;
-    if (!tokensStr) {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
       return res.status(401).json({ error: "Não autenticado com o Google", reauth: true });
     }
 
     const { data, title, spreadsheetId: existingSpreadsheetId } = req.body;
 
     try {
-      const tokens = JSON.parse(tokensStr);
       const auth = getOAuth2Client(req.headers.host);
       setCredentialsAndListen(auth, tokens, res);
 
@@ -369,8 +646,8 @@ async function startServer() {
   });
 
   app.post("/api/gmail/send", async (req, res) => {
-    const tokensStr = req.cookies.google_tokens;
-    if (!tokensStr) {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
       return res.status(401).json({ 
         error: "Sessão do Google expirada ou permissões insuficientes. Por favor, faça login novamente para autorizar o acesso.",
         reauth: true 
@@ -383,7 +660,6 @@ async function startServer() {
     }
 
     try {
-      const tokens = JSON.parse(tokensStr);
       const auth = getOAuth2Client(req.headers.host);
       setCredentialsAndListen(auth, tokens, res);
 
@@ -539,8 +815,8 @@ async function startServer() {
   });
 
   app.post("/api/drive/upload", upload.single("file"), async (req, res) => {
-    const tokensStr = req.cookies.google_tokens;
-    if (!tokensStr) {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
       return res.status(401).json({ error: "Não autenticado com o Google", reauth: true });
     }
 
@@ -553,7 +829,6 @@ async function startServer() {
     console.log(`[Drive] Iniciando upload de arquivo: ${req.file.originalname}. Folder: ${folderName}, Parent: ${parentFolderName}`);
 
     try {
-      const tokens = JSON.parse(tokensStr);
       const auth = getOAuth2Client(req.headers.host);
       setCredentialsAndListen(auth, tokens, res);
 
@@ -659,15 +934,14 @@ async function startServer() {
   });
 
   app.get("/api/drive/list", async (req, res) => {
-    const tokensStr = req.cookies.google_tokens;
-    if (!tokensStr) {
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
       return res.status(401).json({ error: "Não autenticado com o Google", reauth: true });
     }
 
     const { folderName = "AppSheet_Propostas" } = req.query;
 
     try {
-      const tokens = JSON.parse(tokensStr);
       const auth = getOAuth2Client(req.headers.host);
       setCredentialsAndListen(auth, tokens, res);
       const drive = google.drive({ version: "v3", auth });
@@ -713,16 +987,15 @@ async function startServer() {
   });
 
   app.get("/api/drive/file/:fileId", async (req, res) => {
-    const tokensStr = req.cookies.google_tokens;
-    if (!tokensStr) {
-      logDebug("[Drive Route Error] No google_tokens cookie found");
+    const tokens = extractGoogleTokens(req);
+    if (!tokens) {
+      logDebug("[Drive Route Error] No google_tokens found in request headers, cookies or memory");
       return res.status(401).send("Unauthorized");
     }
 
     const { fileId } = req.params;
 
     try {
-      const tokens = JSON.parse(tokensStr);
       logDebug(`[Drive Route] Início de download do arquivo id=${fileId}`);
       const auth = getOAuth2Client(req.headers.host);
       setCredentialsAndListen(auth, tokens, res);
@@ -843,6 +1116,9 @@ async function startServer() {
     }
   });
 
+  // Cache of models that have hit daily free-tier quota limits (429 RESOURCE_EXHAUSTED)
+  const quotaExhaustedModels = new Map<string, number>();
+
   app.post("/api/gemini/extract", async (req, res) => {
     try {
       const { parts, model, responseSchema } = req.body;
@@ -856,7 +1132,24 @@ async function startServer() {
         });
       }
 
-      logDebug(`[Gemini Extract] Iniciando processamento com o modelo: ${model || "gemini-3.1-flash-lite"}, Parts count: ${parts?.length || 0}`);
+      // Cleanup expired quota-exhausted models
+      const now = Date.now();
+      for (const [m, expiry] of quotaExhaustedModels.entries()) {
+        if (now > expiry) {
+          quotaExhaustedModels.delete(m);
+        }
+      }
+
+      // Calculate total payload size to dynamically grant sufficient timeout to multi-megabyte PDFs
+      let payloadChars = 0;
+      if (parts && Array.isArray(parts)) {
+        parts.forEach((p: any) => {
+          payloadChars += (p?.inlineData?.data?.length || 0) + (p?.text?.length || 0);
+        });
+      }
+      const isHeavyPayload = payloadChars > 1500000; // > 1.5MB base64
+
+      logDebug(`[Gemini Extract] Iniciando processamento com o modelo: ${model || "default"}, Parts count: ${parts?.length || 0}, Payload size: ${(payloadChars / 1024 / 1024).toFixed(2)} MB`);
       
       if (parts && Array.isArray(parts)) {
         parts.forEach((p: any, idx: number) => {
@@ -884,64 +1177,237 @@ async function startServer() {
         }
       });
 
-      let response;
-      let usedModel = model || "gemini-3.1-flash-lite";
-      logDebug(`[Gemini Extract] Iniciando chamada com modelo: ${usedModel}...`);
+      // Ordered list of candidate models: prioritize rock-solid stability and high availability
+      const defaultCandidateModels = [
+        "gemini-2.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-flash-latest"
+      ];
 
-      try {
-        response = await ai.models.generateContent({
-          model: usedModel,
-          contents: [{ role: 'user', parts }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: responseSchema || undefined
-          }
+      let requestedModel = model && typeof model === "string" ? model.trim() : "";
+      // If the requested model is currently in cooldown (e.g. 503 high demand or 429 quota), clear it to use the active pool
+      if (requestedModel && quotaExhaustedModels.has(requestedModel)) {
+        logDebug(`[Gemini Extract] Modelo solicitado "${requestedModel}" está em cooldown temporário. Utilizando pool de modelos ativos.`);
+        requestedModel = "";
+      }
+
+      // Filter candidates to bypass models that hit daily quota limits or are in 503 cooldown
+      const activeCandidates = defaultCandidateModels.filter(m => !quotaExhaustedModels.has(m));
+      const pool = activeCandidates.length > 0 ? activeCandidates : defaultCandidateModels;
+
+      const candidateModels = requestedModel && !quotaExhaustedModels.has(requestedModel)
+        ? [requestedModel, ...pool.filter(m => m !== requestedModel)]
+        : pool;
+
+      const isTransientError = (e: any): boolean => {
+        const str = String(e?.message || e?.details || e || "").toLowerCase();
+        const code = Number(e?.status || e?.code || 0);
+        return (
+          code === 503 ||
+          code === 429 ||
+          code === 504 ||
+          code === 502 ||
+          code === 500 ||
+          str.includes("timeout") ||
+          str.includes("high demand") ||
+          str.includes("unavailable") ||
+          str.includes("deadline_exceeded") ||
+          str.includes("deadline exceeded") ||
+          str.includes("timed out") ||
+          str.includes("spikes in demand") ||
+          str.includes("try again later") ||
+          str.includes("resource has been exhausted") ||
+          str.includes("overloaded") ||
+          str.includes("rate limit")
+        );
+      };
+
+      const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+      // Utility to abort individual model call after timeout (prevents hanging requests while giving ample time for large PDFs)
+      const withTimeout = <T>(promise: Promise<T>, ms: number, modelName: string): Promise<T> => {
+        let timer: NodeJS.Timeout;
+        const timeoutPromise = new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Timeout de ${Math.round(ms / 1000)}s excedido na chamada do modelo ${modelName}`));
+          }, ms);
         });
-      } catch (firstErr: any) {
-        const firstErrStr = String(firstErr.message || firstErr.details || firstErr);
-        logDebug(`[Gemini Extract] Falha ao executar com o modelo ${usedModel}: ${firstErrStr}`);
+        return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+      };
 
-        if (usedModel === "gemini-3.1-flash-lite") {
-          usedModel = "gemini-2.5-flash";
-          logDebug(`[Gemini Extract] Fazendo fallback automático para o modelo alternativo altamente disponível: ${usedModel}...`);
-          try {
-            response = await ai.models.generateContent({
-              model: usedModel,
-              contents: [{ role: 'user', parts }],
-              config: {
-                responseMimeType: "application/json",
-                responseSchema: responseSchema || undefined
-              }
-            });
-          } catch (fallbackErr: any) {
-            logDebug(`[Gemini Extract] Falha no fallback para o modelo ${usedModel}: ${fallbackErr.message || String(fallbackErr)}`);
-            throw firstErr; // Throw original error if fallback also fails
+      let response: any = null;
+      let lastErr: any = null;
+      let successfulModel = "";
+      const startTime = Date.now();
+      const MAX_TOTAL_DURATION_MS = 130000; // 130 seconds max overall
+
+      for (let i = 0; i < candidateModels.length; i++) {
+        const currentModel = candidateModels[i];
+        
+        // Skip if model was flagged as quota exhausted
+        if (quotaExhaustedModels.has(currentModel)) {
+          logDebug(`[Gemini Extract] Pulando modelo ${currentModel} pois está na lista de quota esgotada.`);
+          continue;
+        }
+
+        // If total elapsed time is nearing gateway timeout limit, stop cascade
+        if (Date.now() - startTime > MAX_TOTAL_DURATION_MS - 20000) {
+          logDebug(`[Gemini Extract] Tempo total aproximando-se do limite de timeout (${Math.round((Date.now() - startTime) / 1000)}s). Interrompendo cascata.`);
+          break;
+        }
+
+        logDebug(`[Gemini Extract] [Tentativa ${i + 1}/${candidateModels.length}] Testando modelo: ${currentModel}...`);
+
+        try {
+          // Dynamic timeout per model call: 50s for heavy payloads (e.g. 10MB PDFs), 30s for standard documents
+          const modelTimeoutMs = isHeavyPayload ? 50000 : 30000;
+
+          const isGemini3 = currentModel.startsWith("gemini-3");
+          const isLite = currentModel.includes("lite");
+          const callConfig: any = {
+            responseMimeType: "application/json",
+          };
+          if (responseSchema) {
+            callConfig.responseSchema = responseSchema;
           }
-        } else {
-          throw firstErr;
+          if (isGemini3) {
+            // Minimize latency while preserving extraction accuracy
+            callConfig.thinkingConfig = {
+              thinkingLevel: isLite ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW
+            };
+          } else if (currentModel.startsWith("gemini-2.5") && !isLite) {
+            // Setting thinkingBudget: 0 disables excessive deliberation and yields fast JSON extraction
+            callConfig.thinkingConfig = {
+              thinkingBudget: 0
+            };
+          }
+
+          response = await withTimeout(
+            ai.models.generateContent({
+              model: currentModel,
+              contents: [{ role: 'user', parts }],
+              config: callConfig
+            }),
+            modelTimeoutMs,
+            currentModel
+          );
+
+          if (response && response.text) {
+            successfulModel = currentModel;
+            logDebug(`[Gemini Extract] SUCESSO com o modelo "${currentModel}"!`);
+            break;
+          } else {
+            throw new Error("Resposta vazia retornada pela API Gemini");
+          }
+        } catch (modelErr: any) {
+          lastErr = modelErr;
+          const errSummary = String(modelErr?.message || modelErr?.details || modelErr).substring(0, 180);
+          logDebug(`[Gemini Extract] Falha no modelo "${currentModel}": ${errSummary}`);
+
+          const errStr = String(modelErr?.message || modelErr?.details || modelErr);
+          
+          // If model returned 429 quota exhaustion, mark in cache so future calls bypass it immediately
+          if (
+            errStr.includes("Quota exceeded") || 
+            errStr.includes("RESOURCE_EXHAUSTED") ||
+            (errStr.includes("429") && errStr.includes("quota"))
+          ) {
+            logDebug(`[Gemini Extract] Modelo "${currentModel}" atingiu limite diário de quota (429). Registrado como esgotado temporariamente.`);
+            quotaExhaustedModels.set(currentModel, Date.now() + 45 * 60 * 1000); // 45 min suppression
+          }
+
+          // If it's a non-transient, permanent error (e.g. document has no pages, invalid file format, bad API key), stop cascade immediately
+          if (
+            errStr.includes("The document has no pages") ||
+            errStr.includes("Unsupported mime type") ||
+            (errStr.includes("INVALID_ARGUMENT") && (errStr.includes("mime") || errStr.includes("type"))) ||
+            errStr.includes("API_KEY_INVALID") ||
+            errStr.includes("API key not valid")
+          ) {
+            logDebug(`[Gemini Extract] Erro permanente detectado ("${errSummary}"). Interrompendo cascata de modelos.`);
+            throw modelErr;
+          }
+
+          if (i < candidateModels.length - 1 && (Date.now() - startTime < MAX_TOTAL_DURATION_MS)) {
+            logDebug(`[Gemini Extract] Fazendo failover imediato para o próximo modelo candidato (${candidateModels[i + 1]})...`);
+            await delay(300);
+          } else if (i === candidateModels.length - 1 && isTransientError(modelErr) && (Date.now() - startTime < 35000)) {
+            logDebug(`[Gemini Extract] Todos os modelos enfrentaram picos de tráfego. Realizando tentativa final de recuperação com gemini-2.5-flash...`);
+            await delay(1200);
+            try {
+              response = await withTimeout(
+                ai.models.generateContent({
+                  model: "gemini-2.5-flash",
+                  contents: [{ role: 'user', parts }],
+                  config: {
+                    responseMimeType: "application/json",
+                    ...(responseSchema ? { responseSchema } : {}),
+                    thinkingConfig: { thinkingBudget: 0 }
+                  }
+                }),
+                25000,
+                "gemini-2.5-flash-retry"
+              );
+              if (response && response.text) {
+                successfulModel = "gemini-2.5-flash";
+                logDebug(`[Gemini Extract] Recuperação bem-sucedida com gemini-2.5-flash!`);
+                break;
+              }
+            } catch (retryErr: any) {
+              lastErr = retryErr;
+              logDebug(`[Gemini Extract] Falha na tentativa final de recuperação: ${retryErr?.message || retryErr}`);
+            }
+          }
+        }
+
+        if (response && response.text) {
+          break;
         }
       }
 
-      logDebug(`[Gemini Extract] Resposta gerada com sucesso pela API Gemini usando modelo ${usedModel}.`);
-      res.json({ text: response.text });
+      if (!response || !response.text) {
+        throw lastErr || new Error("Não foi possível obter resposta de nenhum dos modelos Gemini disponíveis.");
+      }
+
+      logDebug(`[Gemini Extract] Extração finalizada com êxito pelo modelo ${successfulModel}.`);
+      res.json({ text: response.text, modelUsed: successfulModel });
     } catch (err: any) {
       logDebug(`[Gemini Extract Error] Erro final ao chamar a API Gemini: ${err.message || String(err)}`);
       console.error("[Gemini Server] Erro ao chamar a API Gemini:", err);
       
       let friendlyError = "Erro no processamento da API Gemini pelo servidor";
+      let statusCode = 500;
       const errStr = String(err.message || err.details || err);
       
       if (errStr.includes("The document has no pages")) {
         friendlyError = "O arquivo PDF enviado parece não conter nenhuma página válida ou está em branco. Certifique-se de que o documento não esteja protegido ou corrompido.";
+        statusCode = 400;
       } else if (errStr.includes("Unsupported mime type") || (errStr.includes("INVALID_ARGUMENT") && (errStr.includes("mime") || errStr.includes("type")))) {
         friendlyError = "O formato de arquivo enviado não é suportado pelo analisador de documentos. Por favor, utilize PDF ou Imagens (PNG, JPG, WEBP).";
+        statusCode = 400;
       } else if (errStr.includes("Resource has been exhausted") || errStr.includes("429")) {
         friendlyError = "Limite de requisições do Gemini excedido temporariamente. Por favor, tente novamente em instantes.";
+        statusCode = 429;
       } else if (errStr.includes("API_KEY_INVALID") || errStr.includes("API key not valid")) {
         friendlyError = "A chave de API do Gemini configurada é inválida ou expirou. Verifique as configurações de secrets do servidor.";
+        statusCode = 401;
+      } else if (
+        errStr.includes("high demand") || 
+        errStr.includes("503") || 
+        errStr.includes("UNAVAILABLE") || 
+        errStr.includes("DEADLINE_EXCEEDED") ||
+        errStr.includes("Spikes in demand")
+      ) {
+        friendlyError = "Os servidores de inteligência artificial da Google estão temporariamente com alta demanda. Por favor, aguarde alguns instantes e tente novamente.";
+        statusCode = 503;
+      } else if (errStr.includes("Timeout") || errStr.includes("excedido")) {
+        friendlyError = "O tempo de processamento do documento excedeu o limite. Tente enviar arquivos menores ou com menos páginas.";
+        statusCode = 504;
       }
       
-      res.status(500).json({ 
+      res.status(statusCode).json({ 
         error: friendlyError, 
         details: err.message || String(err)
       });

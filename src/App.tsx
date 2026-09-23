@@ -31,6 +31,7 @@ import {
   Filter,
   FileSearch,
   Eye,
+  EyeOff,
   Share2,
   Copy,
   X,
@@ -54,7 +55,8 @@ import {
   Lock,
   UserPlus,
   LogIn,
-  KeyRound
+  KeyRound,
+  FileSpreadsheet
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from "jspdf";
@@ -88,7 +90,13 @@ import {
   User,
   signOut
 } from 'firebase/auth';
-import { calcularRateioCascata, WaterfallResult, obterRateioConsolidado } from './lib/waterfallCalculator';
+import { 
+  calcularRateioCascata, 
+  WaterfallResult, 
+  obterRateioConsolidado,
+  gerarDiagnosticoEspecialista,
+  DiagnosticoEspecialista 
+} from './lib/waterfallCalculator';
 import { 
   DocumentState, 
   ExtractionResult, 
@@ -115,6 +123,7 @@ import {
   extrairCondicaoPagamentoDoFluxo,
   CondicaoPagamentoItem
 } from './lib/commissionCalculator';
+import { generateWebropayExcel } from './lib/webropayExporter';
 
 enum OperationType {
   CREATE = 'create',
@@ -167,8 +176,17 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   throw new Error(JSON.stringify(errInfo));
 }
 
+const getApiUrl = (endpoint: string): string => {
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  if (Capacitor.isNativePlatform()) {
+    const remoteUrl = "https://ais-dev-mnko3fredg5cl6fz5xbf3b-366038558643.us-east1.run.app";
+    return `${remoteUrl}${cleanEndpoint}`;
+  }
+  return cleanEndpoint;
+};
+
 const safeFetchJson = async (url: string, options?: RequestInit) => {
-  const response = await fetch(url, options);
+  const response = await fetch(getApiUrl(url), options);
   const text = await response.text();
   let data;
   try {
@@ -281,6 +299,7 @@ export default function App() {
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [isExportingDashboard, setIsExportingDashboard] = useState(false);
   const [isExportingToSheets, setIsExportingToSheets] = useState(false);
+  const [isExportingWebropay, setIsExportingWebropay] = useState(false);
   const [isUploadingToDrive, setIsUploadingToDrive] = useState(false);
   const [view, setView] = useState<'extract' | 'dashboard' | 'inbox' | 'empreendimentos' | 'usuarios' | 'rateio' | 'cargos'>('extract');
   const [cargos, setCargos] = useState<CargoCadastro[]>([]);
@@ -294,7 +313,7 @@ export default function App() {
   const [isLoadingInbox, setIsLoadingInbox] = useState(false);
   const [showCargoModal, setShowCargoModal] = useState(false);
   const [showCargosFillableModal, setShowCargosFillableModal] = useState(false);
-  const [rateioTab, setRateioTab] = useState<'geral' | 'cargos'>('geral');
+  const [rateioTab, setRateioTab] = useState<'geral' | 'cargos' | 'especialista'>('geral');
   const [cargosTab, setCargosTab] = useState<'lista_cargos' | 'participantes'>('lista_cargos');
   const [editingCargo, setEditingCargo] = useState<CargoCadastro | null>(null);
   const [cargoForm, setCargoForm] = useState({
@@ -312,6 +331,7 @@ export default function App() {
   });
   const [isSavingCargo, setIsSavingCargo] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [copiedRelatorio, setCopiedRelatorio] = useState(false);
   const [activePartySearchIdx, setActivePartySearchIdx] = useState<number | null>(null);
   const [partySearchQuery, setPartySearchQuery] = useState<string>('');
   const [user, setUser] = useState<User | null>(null);
@@ -328,7 +348,24 @@ export default function App() {
   const [viewComissaoDetalhada, setViewComissaoDetalhada] = useState(false);
   const [isSendingEmail, setIsSendingEmail] = useState(false);
   const [gmailApiError, setGmailApiError] = useState<{ message: string; link?: string } | null>(null);
-  const [authMode, setAuthMode] = useState<'google' | 'email'>('google');
+  const [authMode, setAuthMode] = useState<'google' | 'email'>(() => {
+    try {
+      return (localStorage.getItem('preferred_auth_mode') as 'google' | 'email') || 'email';
+    } catch {
+      return 'email';
+    }
+  });
+  const [showAuthPassword, setShowAuthPassword] = useState(false);
+  const switchAuthMode = (mode: 'google' | 'email') => {
+    setAuthMode(mode);
+    setAuthError(null);
+    setAuthSuccessMessage(null);
+    try {
+      localStorage.setItem('preferred_auth_mode', mode);
+    } catch {
+      // ignore
+    }
+  };
   const [isRegistering, setIsRegistering] = useState(false);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
@@ -336,6 +373,33 @@ export default function App() {
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null);
+
+  const getParticipantApelido = (name?: string, localCorretores?: Array<{ nome_completo: string; apelido: string }>): string => {
+    if (!name || !name.trim() || name.includes('___')) return '';
+    const parts = name.split(',').map(n => n.trim()).filter(Boolean);
+    const nicknames = parts.map(part => {
+      if (localCorretores && localCorretores.length > 0) {
+        const foundLocal = localCorretores.find(c =>
+          (c.nome_completo && c.nome_completo.trim().toLowerCase() === part.toLowerCase()) ||
+          (c.apelido && c.apelido.trim().toLowerCase() === part.toLowerCase()) ||
+          (c.nome_completo && c.nome_completo.trim().toLowerCase().startsWith(part.toLowerCase()))
+        );
+        if (foundLocal?.apelido && foundLocal.apelido.trim()) {
+          return foundLocal.apelido.trim();
+        }
+      }
+      const matched = cargos.find(c =>
+        (c.nome && c.nome.trim().toLowerCase() === part.toLowerCase()) ||
+        (c.apelido && c.apelido.trim().toLowerCase() === part.toLowerCase()) ||
+        (c.nome && c.nome.trim().toLowerCase().startsWith(part.toLowerCase()))
+      );
+      if (matched?.apelido && matched.apelido.trim()) {
+        return matched.apelido.trim();
+      }
+      return part.split(' ')[0].trim();
+    });
+    return nicknames.join(', ');
+  };
 
   const showToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'info') => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -560,7 +624,8 @@ export default function App() {
     const sumExcluded = (proposal.payments || [])
       .filter((p: any) => isExcludedFromCommissionBase(p.tipo))
       .reduce((acc: number, p: any) => acc + (p.valorTotal || 0), 0);
-    const baseVendaTotal = Math.max(0, (proposal.valorTotalProposta || (proposal.payments || []).reduce((acc: number, p: any) => acc + (p.valorTotal || 0), 0)) - sumExcluded);
+    const sumAllParcelas = (proposal.payments || []).reduce((acc: number, p: any) => acc + (p.valorTotal || 0), 0);
+    const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : (proposal.valorTotalProposta || 0)) - sumExcluded);
 
     // Compute or retrieve waterfallResult
     let waterfall = proposal.manual_waterfall ? obterRateioConsolidado(proposal.manual_waterfall) : null;
@@ -633,9 +698,7 @@ export default function App() {
           : null;
 
         const vencimentoToShow = correspondingSimFluxo ? correspondingSimFluxo.vencimento : p.vencimento;
-        const valorComissaoToShow = correspondingSimFluxo 
-          ? Number((correspondingSimFluxo.valorTotal - correspondingSimFluxo.valorLiquido).toFixed(2)) 
-          : p.valorRetido;
+        const valorComissaoToShow = p.valorRetido;
 
         if (valorComissaoToShow > 0) {
           const instCommission = valorComissaoToShow;
@@ -700,55 +763,153 @@ export default function App() {
   };
 
 
-  // Synchronize default signers when proposal result changes
-  useEffect(() => {
-    if (!result) return;
-    const list: any[] = [];
-    
-    // 1. Clients / Customers (Contratantes / Compradores)
-    const customers = (result.customers || [(result as any).customer]).filter(Boolean);
-    if (customers.length > 0) {
-      customers.forEach((cust: any, idx: number) => {
-        if (cust && cust.nome) {
-          list.push({
-            name: cust.nome,
-            email: cust.email || '',
-            cpf: cust.cpf || '',
-            role: customers.length > 1 ? `Contratante ${idx + 1}` : 'Contratante'
-          });
+  // Helper to extract all official signers from the Brokerage Contract (Contrato de Corretagem)
+  const getContractSignersList = useCallback((
+    currentResult: ExtractionResult | null,
+    cargosList: CargoCadastro[] = [],
+    partiesList: any[] = []
+  ) => {
+    if (!currentResult) return [];
+    const list: Array<{
+      name: string;
+      email: string;
+      cpf: string;
+      role: string;
+      phone?: string;
+    }> = [];
+
+    // 1. Contratantes / Compradores (todos os proponentes compradores qualificados no contrato)
+    const rawCustomers = (currentResult.customers && currentResult.customers.length > 0)
+      ? currentResult.customers
+      : [(currentResult as any).customer].filter(Boolean);
+    const customers = rawCustomers.length > 0 ? rawCustomers : [];
+
+    customers.forEach((cust: any, idx: number) => {
+      if (cust && (cust.nome || cust.cpf)) {
+        list.push({
+          name: cust.nome || `Contratante ${idx + 1}`,
+          email: cust.email || '',
+          cpf: cust.cpf || '',
+          phone: cust.telefone || '',
+          role: customers.length > 1 ? `Contratante ${idx + 1}` : 'Contratante'
+        });
+      }
+    });
+
+    if (list.length === 0) {
+      list.push({
+        name: 'Cliente Contratante',
+        email: '',
+        cpf: '',
+        role: 'Contratante'
+      });
+    }
+
+    // 2. Imobiliária Contratada (Intermediadora oficial no Contrato de Corretagem)
+    list.push({
+      name: 'RODOLFO JERRY IMÓVEIS LTDA',
+      email: 'propostasrej@gmail.com',
+      cpf: '29.881.101/0001-09',
+      role: 'Imobiliária'
+    });
+
+    // 3. Corretores Associados e Equipe de Vendas (Item III e Cláusula de Partilha do Contrato)
+    const activeParties = (currentResult as any).manual_waterfall?.participantes || (currentResult as any).commissionedParties || (currentResult as any).commissioned_parties || partiesList || [];
+    const seenNames = new Set<string>();
+
+    activeParties.forEach((p: any) => {
+      if (p.hideAndSum) return;
+      if (!p.name || p.name.includes('___')) return;
+      const names = p.name.split(',').map((n: string) => n.trim()).filter(Boolean);
+      names.forEach((nameTrimmed: string) => {
+        const lower = nameTrimmed.toLowerCase();
+        if (seenNames.has(lower)) return;
+        seenNames.add(lower);
+
+        // Buscar dados completos no cadastro de Cargos/Membros
+        const match = cargosList.find(c => 
+          (c.nome && c.nome.toLowerCase().trim() === lower) ||
+          (c.apelido && c.apelido.toLowerCase().trim() === lower)
+        ) || cargosList.find(c => 
+          c.nome && c.nome.toLowerCase().trim().startsWith(lower)
+        );
+
+        list.push({
+          name: match?.nome || nameTrimmed,
+          email: match?.email || '',
+          cpf: match?.cpf_cnpj || '',
+          phone: match?.telefone || '',
+          role: p.role || match?.cargo || 'Corretor'
+        });
+      });
+    });
+
+    // Incluir membros da equipe de vendas (salesTeam) não mapeados ainda
+    if (currentResult.salesTeam) {
+      const st = currentResult.salesTeam;
+      const teamEntries = [
+        { name: st.corretor1, role: 'Corretor' },
+        { name: st.corretor2, role: 'Corretor' },
+        { name: st.gerente, role: 'Gerente' },
+        { name: st.diretor, role: 'Diretor' },
+        { name: st.coordenador, role: 'Coordenador' }
+      ];
+
+      teamEntries.forEach(entry => {
+        if (entry.name && entry.name.trim() && !entry.name.includes('___')) {
+          const lower = entry.name.trim().toLowerCase();
+          if (!seenNames.has(lower)) {
+            seenNames.add(lower);
+            const match = cargosList.find(c => 
+              (c.nome && c.nome.toLowerCase().trim() === lower) ||
+              (c.apelido && c.apelido.toLowerCase().trim() === lower)
+            );
+            list.push({
+              name: match?.nome || entry.name.trim(),
+              email: match?.email || '',
+              cpf: match?.cpf_cnpj || '',
+              phone: match?.telefone || '',
+              role: entry.role || match?.cargo || 'Corretor'
+            });
+          }
         }
       });
     }
 
-    // 2. Broker / Corretor
-    const activeParties = (result as any).commissionedParties || (result as any).commissioned_parties || commissionedParties || [];
-    const mainBroker = activeParties.find((p: any) => p.role === 'Corretor' && p.name);
-    if (mainBroker) {
-      list.push({
-        name: mainBroker.name,
-        email: mainBroker.email || '',
-        cpf: mainBroker.cpf_cnpj || '',
-        role: 'Corretor'
-      });
-    } else if (result.salesTeam?.corretor1) {
-      list.push({
-        name: result.salesTeam.corretor1,
-        email: '',
-        cpf: '',
-        role: 'Corretor'
-      });
-    }
-
-    // 3. Testemunha 1 (as standard witness)
+    // 4. Testemunhas Instrumentárias (Exigência legal do Contrato de Corretagem: 2 testemunhas)
     list.push({
       name: 'Testemunha 1',
       email: '',
       cpf: '',
       role: 'Testemunha'
     });
+    list.push({
+      name: 'Testemunha 2',
+      email: '',
+      cpf: '',
+      role: 'Testemunha'
+    });
 
+    return list;
+  }, []);
+
+  // Synchronize default signers from the Brokerage Contract when proposal result changes
+  useEffect(() => {
+    if (!result) return;
+    const list = getContractSignersList(result, cargos, commissionedParties);
     setEditingSigners(list);
-  }, [result]);
+  }, [result, cargos, getContractSignersList]);
+
+  // Função manual para sincronizar signatários da proposta com o Contrato de Corretagem
+  const handleSyncContractSigners = () => {
+    if (!result) {
+      showToast("Nenhuma proposta carregada para sincronizar.", "error");
+      return;
+    }
+    const list = getContractSignersList(result, cargos, commissionedParties);
+    setEditingSigners(list);
+    showToast("Tabela 'Quem Assina' sincronizada com as assinaturas do Contrato de Corretagem!", "success");
+  };
 
   const handleCameraCapture = async (id: string) => {
     setActiveCaptureId(id);
@@ -829,6 +990,7 @@ export default function App() {
     nome: '',
     construtora: '',
     localizacao: '',
+    endereco: '',
     tabela_base_id: '',
     status: 'ATIVO' as 'ATIVO' | 'INATIVO',
     regras_comissao: [] as RegraComissao[],
@@ -1224,18 +1386,37 @@ export default function App() {
       await syncUserProfile(result.user);
       showToast(`Bem-vindo, ${result.user.displayName || result.user.email || 'usuário'}!`, 'success');
     } catch (err: any) {
-      console.error("Erro ao fazer login com Google:", err);
+      const isPopupClosed = 
+        err?.code === 'auth/popup-closed-by-user' || 
+        err?.code === 'auth/cancelled-popup-request' ||
+        err?.code === 'auth/user-cancelled' ||
+        (typeof err?.message === 'string' && (
+          err.message.includes('popup-closed-by-user') || 
+          err.message.includes('cancelled-popup-request') ||
+          err.message.includes('user-cancelled')
+        ));
+
+      if (isPopupClosed) {
+        // User closed or cancelled the popup dialog - normal flow, not an error
+        console.info("Login com Google cancelado pelo usuário.");
+        return;
+      }
+
       let msg = "Erro ao fazer login com Google.";
       if (err.code === 'auth/popup-blocked') {
+        console.warn("Pop-up bloqueado pelo navegador:", err);
         msg = "O navegador bloqueou a janela pop-up do Google. Permita pop-ups neste navegador ou utilize a aba 'E-mail e Senha' logo abaixo.";
       } else if (err.code === 'auth/unauthorized-domain') {
+        console.warn("Domínio de acesso não autorizado no Firebase Console:", err);
         msg = "Domínio de acesso não autorizado no Firebase Console. Utilize a aba 'E-mail e Senha' para acessar normalmente.";
-      } else if (err.code === 'auth/cancelled-popup-request' || err.code === 'auth/popup-closed-by-user') {
-        msg = "A janela de login do Google foi fechada antes de concluir.";
       } else if (err.code === 'auth/network-request-failed') {
+        console.warn("Falha na conexão de rede:", err);
         msg = "Falha na conexão de rede. Verifique sua conexão com a internet.";
-      } else if (err.message) {
-        msg = `Erro na autenticação: ${err.message}`;
+      } else {
+        console.error("Erro ao fazer login com Google:", err);
+        if (err.message) {
+          msg = `Erro na autenticação: ${err.message}`;
+        }
       }
       setAuthError(msg);
       showToast(msg, 'error');
@@ -1278,20 +1459,27 @@ export default function App() {
         showToast(`Bem-vindo, ${cred.user.displayName || cred.user.email}!`, 'success');
       }
     } catch (err: any) {
-      console.error("Erro na autenticação por email:", err);
       let msg = "Não foi possível autenticar.";
       if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
+        console.warn("Credenciais inválidas na autenticação por email:", err.code);
         msg = "E-mail ou senha incorretos. Verifique os dados ou crie uma nova conta.";
       } else if (err.code === 'auth/email-already-in-use') {
+        console.warn("Email já cadastrado:", err.code);
         msg = "Este e-mail já está cadastrado. Alterne para a aba de 'Entrar' ou redefina sua senha.";
       } else if (err.code === 'auth/weak-password') {
+        console.warn("Senha fraca:", err.code);
         msg = "A senha deve conter no mínimo 6 caracteres.";
       } else if (err.code === 'auth/invalid-email') {
+        console.warn("Formato de email inválido:", err.code);
         msg = "Formato de e-mail inválido. Verifique o endereço digitado.";
       } else if (err.code === 'auth/network-request-failed') {
+        console.warn("Falha de rede na autenticação por email:", err);
         msg = "Falha de rede. Verifique sua conexão com a internet.";
-      } else if (err.message) {
-        msg = err.message;
+      } else {
+        console.error("Erro na autenticação por email:", err);
+        if (err.message) {
+          msg = err.message;
+        }
       }
       setAuthError(msg);
       showToast(msg, 'error');
@@ -1314,12 +1502,18 @@ export default function App() {
       setAuthSuccessMessage("E-mail de redefinição de senha enviado! Verifique sua caixa de entrada e spam.");
       showToast("E-mail de recuperação enviado com sucesso!", 'success');
     } catch (err: any) {
-      console.error("Erro ao enviar reset:", err);
       let msg = "Erro ao enviar e-mail de recuperação.";
       if (err.code === 'auth/user-not-found') {
+        console.warn("Usuário não encontrado:", err.code);
         msg = "Nenhum usuário cadastrado com este e-mail.";
       } else if (err.code === 'auth/invalid-email') {
+        console.warn("Email inválido:", err.code);
         msg = "Formato de e-mail inválido.";
+      } else {
+        console.error("Erro ao enviar reset:", err);
+        if (err.message) {
+          msg = err.message;
+        }
       }
       setAuthError(msg);
       showToast(msg, 'error');
@@ -1483,10 +1677,13 @@ export default function App() {
     const path = `entrada/${id}`;
     try {
       const docRef = doc(db, 'entrada', id);
-      await updateDoc(docRef, { status: newStatus });
+      await updateDoc(docRef, { 
+        status: newStatus,
+        updated_at: new Date().toISOString()
+      });
       
       setSavedExtractions(prev => prev.map(ext => 
-        ext.id === id ? { ...ext, status: newStatus } : ext
+        ext.id === id ? { ...ext, status: newStatus, updated_at: new Date().toISOString() } : ext
       ));
     } catch (err: any) {
       handleFirestoreError(err, OperationType.UPDATE, path);
@@ -1498,10 +1695,13 @@ export default function App() {
     const path = `entrada/${id}`;
     try {
       const docRef = doc(db, 'entrada', id);
-      await updateDoc(docRef, { [field]: value });
+      await updateDoc(docRef, { 
+        [field]: value,
+        updated_at: new Date().toISOString()
+      });
       
       setSavedExtractions(prev => prev.map(ext => 
-        ext.id === id ? { ...ext, [field]: value } : ext
+        ext.id === id ? { ...ext, [field]: value, updated_at: new Date().toISOString() } : ext
       ));
     } catch (err: any) {
       handleFirestoreError(err, OperationType.UPDATE, path);
@@ -1539,12 +1739,15 @@ export default function App() {
     await new Promise(resolve => setTimeout(resolve, 600));
 
     const currentEmp = empreendimentos.find(e => e.nome === result.property.empreendimento);
+    const effectivePercentual = percentualComissao;
+
     const sim = processarProposta(
       result.payments, 
-      percentualComissao, 
+      effectivePercentual, 
       currentEmp?.regras_comissao, 
       installmentConfigs,
-      result.forma_pagamento_comissao
+      result.forma_pagamento_comissao,
+      result.valorTotalProposta
     );
     
     setSimulationResult(sim);
@@ -1554,11 +1757,12 @@ export default function App() {
       const sumExcluded = result.payments
         .filter(p => isExcludedFromCommissionBase(p.tipo))
         .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-      const baseVendaTotal = Math.max(0, (result.valorTotalProposta || result.payments.reduce((acc, p) => acc + p.valorTotal, 0)) - sumExcluded);
+      const sumAllParcelas = result.payments.reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : (result.valorTotalProposta || 0)) - sumExcluded);
 
       const waterfall = calcularRateioCascata(
         baseVendaTotal,
-        percentualComissao,
+        effectivePercentual,
         sim.fluxo,
         result.forma_pagamento_comissao,
         commissionedParties,
@@ -1582,8 +1786,17 @@ export default function App() {
       balance: p.cap
     }));
 
+    // Atualizar valorRetido de cada parcela somando os valores de sua distribuição
+    const finalDetalhes = updatedDetalhes.map(det => {
+      const rowSum: number = Object.values(det.distribuicao || {}).reduce<number>((sum, v) => sum + (Number(v) || 0), 0);
+      return {
+        ...det,
+        valorRetido: Number(rowSum.toFixed(2))
+      };
+    });
+
     // Somar todas as distribuições em cada detalhe de parcela
-    updatedDetalhes.forEach(det => {
+    finalDetalhes.forEach(det => {
       Object.entries(det.distribuicao || {}).forEach(([label, value]) => {
         const valNum = Number(value) || 0;
         const pIdx = updatedParticipantes.findIndex(p => {
@@ -1604,7 +1817,7 @@ export default function App() {
     return {
       ...waterfallResult,
       participantes: updatedParticipantes,
-      detalhesParcelas: updatedDetalhes,
+      detalhesParcelas: finalDetalhes,
       saldoRestanteComissao
     };
   };
@@ -1671,26 +1884,39 @@ export default function App() {
     }
   }, [result?.property?.empreendimento, empreendimentos]);
 
-  // Automatically recalculate waterfall when commissionedParties, percentualComissao, or proposal data changes
+  // Automatically recalculate waterfall and simulation when commissionedParties, percentualComissao, or proposal data changes
   useEffect(() => {
-    if (result && simulationResult && !isManualRateio) {
+    if (result && !isManualRateio) {
+      const currentEmp = empreendimentos.find(e => e.nome === result.property.empreendimento);
+      const effectivePercentual = percentualComissao;
+
+      const sim = processarProposta(
+        result.payments, 
+        effectivePercentual, 
+        currentEmp?.regras_comissao, 
+        installmentConfigs,
+        result.forma_pagamento_comissao,
+        result.valorTotalProposta
+      );
+      setSimulationResult(sim);
+
       const sumExcluded = result.payments
         .filter(p => isExcludedFromCommissionBase(p.tipo))
         .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-      const baseVendaTotal = Math.max(0, (result.valorTotalProposta || result.payments.reduce((acc, p) => acc + p.valorTotal, 0)) - sumExcluded);
-      const currentEmp = empreendimentos.find(e => e.nome === result.property.empreendimento);
+      const sumAllParcelas = result.payments.reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : (result.valorTotalProposta || 0)) - sumExcluded);
 
       const waterfall = calcularRateioCascata(
         baseVendaTotal,
-        percentualComissao,
-        simulationResult.fluxo,
+        effectivePercentual,
+        sim.fluxo,
         result.forma_pagamento_comissao,
         commissionedParties,
         currentEmp?.regras_comissao
       );
       setWaterfallResult(waterfall);
     }
-  }, [commissionedParties, percentualComissao, result, simulationResult, empreendimentos, isManualRateio]);
+  }, [commissionedParties, percentualComissao, result, installmentConfigs, empreendimentos, isManualRateio]);
 
   const updateResult = (section: keyof ExtractionResult, field: string, value: any) => {
     setResult(prev => {
@@ -1757,10 +1983,13 @@ export default function App() {
       
       // Recalculate total if unit or quantity changes
       if (field === 'quantidade' || field === 'valorUnitario') {
-        newPayments[index].valorTotal = newPayments[index].quantidade * newPayments[index].valorUnitario;
+        const qty = Number(newPayments[index].quantidade) || 0;
+        const val = Number(newPayments[index].valorUnitario) || 0;
+        newPayments[index].valorTotal = Number((qty * val).toFixed(2));
       }
       
-      return { ...prev, payments: newPayments };
+      const newTotal = Number(newPayments.reduce((acc, p) => acc + (p.valorTotal || 0), 0).toFixed(2));
+      return { ...prev, payments: newPayments, valorTotalProposta: newTotal };
     });
   };
 
@@ -1774,7 +2003,9 @@ export default function App() {
         vencimento: '',
         valorTotal: 0
       };
-      return { ...prev, payments: [...prev.payments, newPayment] };
+      const newPayments = [...prev.payments, newPayment];
+      const newTotal = Number(newPayments.reduce((acc, p) => acc + (p.valorTotal || 0), 0).toFixed(2));
+      return { ...prev, payments: newPayments, valorTotalProposta: newTotal };
     });
   };
 
@@ -1782,7 +2013,8 @@ export default function App() {
     setResult(prev => {
       if (!prev) return null;
       const newPayments = prev.payments.filter((_, i) => i !== index);
-      return { ...prev, payments: newPayments };
+      const newTotal = Number(newPayments.reduce((acc, p) => acc + (p.valorTotal || 0), 0).toFixed(2));
+      return { ...prev, payments: newPayments, valorTotalProposta: newTotal };
     });
   };
 
@@ -1832,6 +2064,67 @@ export default function App() {
         resolve(base64String);
       };
       reader.onerror = error => reject(error);
+    });
+  };
+
+  const optimizeImageForOcr = async (file: File): Promise<Uint8Array> => {
+    return new Promise((resolve) => {
+      const isImg = file.type.startsWith('image/') || /\.(jpe?g|png|webp)$/i.test(file.name);
+      if (!isImg) {
+        file.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const maxDim = 1600;
+            let { width, height } = img;
+            if (width > maxDim || height > maxDim) {
+              if (width > height) {
+                height = Math.round((height * maxDim) / width);
+                width = maxDim;
+              } else {
+                width = Math.round((width * maxDim) / height);
+                height = maxDim;
+              }
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+              file.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+              return;
+            }
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(img, 0, 0, width, height);
+            canvas.toBlob(
+              (blob) => {
+                if (blob) {
+                  blob.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+                } else {
+                  file.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+                }
+              },
+              'image/jpeg',
+              0.82
+            );
+          } catch (err) {
+            file.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+          }
+        };
+        img.onerror = () => {
+          file.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+        };
+        img.src = e.target?.result as string;
+      };
+      reader.onerror = () => {
+        file.arrayBuffer().then(b => resolve(new Uint8Array(b))).catch(() => resolve(new Uint8Array()));
+      };
+      reader.readAsDataURL(file);
     });
   };
 
@@ -1960,12 +2253,14 @@ export default function App() {
                 hasPages = true;
               });
             } else {
-              console.log(`[Extraction] Embutindo imagem em no PDF master: ${file.name}`);
+              console.log(`[Extraction] Otimizando e embutindo imagem no PDF master: ${file.name}`);
+              const optimizedBytes = await optimizeImageForOcr(file);
               let image;
-              if (file.type === 'image/jpeg' || file.type === 'image/jpg' || ext === 'jpg' || ext === 'jpeg') {
-                image = await mergedPdf.embedJpg(fileBytes);
-              } else if (file.type === 'image/png' || ext === 'png') {
-                image = await mergedPdf.embedPng(fileBytes);
+              try {
+                image = await mergedPdf.embedJpg(optimizedBytes);
+              } catch (embedErr) {
+                console.warn("[Extraction] embedJpg falhou, tentando embedPng:", embedErr);
+                image = await mergedPdf.embedPng(optimizedBytes).catch(() => null);
               }
               if (image) {
                 const page = mergedPdf.addPage();
@@ -2008,10 +2303,10 @@ export default function App() {
       const prompt = `Você é o Analista de Cadastro R&J. Extraia os dados destes documentos imobiliários.
       
       Instruções:
-      1. Identifique o Empreendimento, Unidade e Torre.
+      1. Identifique o Empreendimento, Unidade, Torre e a Cidade/Estado (Município e UF) onde o imóvel está localizado.
       2. Identifique os Corretores.
       3. Extraia os DADOS DOS CLIENTES (Pode haver mais de um comprador): Nome, CPF, Telefone, Email, Data de Nascimento, RG (N.º, Órgão Expedidor, Data de Expedição), Estado Civil, Profissão, Naturalidade, Nacionalidade.
-      4. Extraia o ENDEREÇO: CEP, Logradouro, N.º, Complemento, Bairro, Cidade, Estado.
+      4. Extraia o ENDEREÇO DE RESIDÊNCIA DO COMPRADOR: CEP, Logradouro, N.º, Complemento, Bairro, Cidade, Estado.
       5. Extraia a tabela de pagamentos completa (Quantidade, Tipo, Valor Unitário, Vencimento, Valor Total).
          - IMPORTANTE: No campo 'tipo' da parcela, certifique-se de incluir termos de periodicidade caso existam (ex: "INTERMEDIÁRIA ANUAL", "REFORÇO SEMESTRAL", "TRIMESTRAL").
       6. Identifique o VALOR TOTAL DA PROPOSTA/VENDA indicado no documento.
@@ -2022,22 +2317,90 @@ export default function App() {
       
       ATENÇÃO PARA EVITAR SINTAXE DE JSON TRUNCADO: Os campos textuais de descrição, mensagens de validação e nomes devem ser EXTREMAMENTE curtos, diretos e objetivos (ex: descrição de documento de no máximo 10 palavras). Evite longas justificativas ou explicações verbosas.`;
 
-      const response = await fetch("/api/gemini/extract", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          parts: [...parts, { text: prompt }],
-          model: "gemini-3.1-flash-lite",
-          responseSchema: EXTRACTION_SCHEMA
-        }),
-      });
+      let responseData: any = null;
+      let lastErrorMessage: string = "";
+      const extractUrl = getApiUrl("/api/gemini/extract");
+      const candidateModels = ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || errorData.details || "Erro no processamento pelo servidor");
+      // Loop de execução robusto com retentativa automática e failover progressivo
+      for (let attempt = 1; attempt <= candidateModels.length; attempt++) {
+        const targetModel = candidateModels[attempt - 1];
+        try {
+          const fetchRes = await fetch(extractUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              parts: [...parts, { text: prompt }],
+              model: targetModel,
+              responseSchema: EXTRACTION_SCHEMA
+            }),
+          });
+
+          const rawText = await fetchRes.text();
+          const isHtml = rawText.trim().startsWith("<");
+
+          // Se a resposta for HTML (ex: proxy de contêiner ou reinício temporário), tenta novamente
+          if (isHtml) {
+            console.warn(`[Extraction] Servidor retornou HTML (HTTP ${fetchRes.status}) na tentativa ${attempt}.`);
+            if (attempt < candidateModels.length) {
+              showToast("Sincronizando com o servidor de IA...", "info");
+              await new Promise(r => setTimeout(r, 1800));
+              continue;
+            } else {
+              lastErrorMessage = "O servidor de IA está temporariamente indisponível ou reiniciando. Por favor, tente novamente em alguns instantes.";
+              break;
+            }
+          }
+
+          let json: any = {};
+          try {
+            json = JSON.parse(rawText);
+          } catch {
+            console.warn(`[Extraction] Resposta não-JSON recebida na tentativa ${attempt}:`, rawText.substring(0, 150));
+            if (attempt < candidateModels.length) {
+              await new Promise(r => setTimeout(r, 1500));
+              continue;
+            } else {
+              lastErrorMessage = `Resposta inválida recebida do servidor (${fetchRes.status}). Tente novamente.`;
+              break;
+            }
+          }
+
+          // Se status não for OK (ex: 503 alta demanda ou 429 rate limit), faz failover para o próximo modelo
+          if (!fetchRes.ok) {
+            const errDetail = json.error || json.details || `Erro ${fetchRes.status}`;
+            console.warn(`[Extraction] Erro do servidor na tentativa ${attempt} (${targetModel}):`, errDetail);
+            lastErrorMessage = json.error || json.details || `Erro no processamento (${fetchRes.status})`;
+
+            if ((fetchRes.status === 503 || fetchRes.status === 429 || fetchRes.status === 500 || fetchRes.status === 504) && attempt < candidateModels.length) {
+              showToast("Otimizando requisição de IA com modelo de alta disponibilidade...", "info");
+              await new Promise(r => setTimeout(r, 1500));
+              continue;
+            } else {
+              break;
+            }
+          }
+
+          // Sucesso
+          responseData = json;
+          break;
+        } catch (fetchErr: any) {
+          console.warn(`[Extraction] Falha na requisição de rede (tentativa ${attempt}):`, fetchErr);
+          lastErrorMessage = fetchErr?.message || "Falha na conexão de rede com o servidor de IA.";
+          if (attempt < candidateModels.length) {
+            showToast("Conexão instável. Reconectando ao serviço de IA...", "info");
+            await new Promise(r => setTimeout(r, 1800));
+          }
+        }
       }
 
-      const responseData = await response.json();
+      if (!responseData) {
+        throw new Error(
+          lastErrorMessage || 
+          "Não foi possível processar a extração com a IA no momento. Por favor, tente novamente."
+        );
+      }
+
       const text = responseData.text;
       if (!text) throw new Error("A IA não retornou dados.");
       
@@ -2061,8 +2424,12 @@ export default function App() {
       setDocs(prev => prev.map(d => ({ ...d, status: 'completed' })));
     } catch (err: any) {
       console.error("Erro na extração:", err);
-      setError(err.message || "Erro ao processar os documentos. Verifique se os arquivos são legíveis.");
-      showToast(err.message || 'Erro ao processar documentos.', 'error');
+      let userFriendlyMessage = err.message || "Erro ao processar os documentos. Verifique se os arquivos são legíveis.";
+      if (String(err).includes("Failed to fetch") || userFriendlyMessage.includes("Failed to fetch")) {
+        userFriendlyMessage = "Falha de conexão com o servidor de IA (tempo limite excedido ou rede interrompida). Por favor, tente novamente.";
+      }
+      setError(userFriendlyMessage);
+      showToast(userFriendlyMessage, 'error');
       setDocs(prev => prev.map(d => ({ ...d, status: 'error' })));
     } finally {
       setIsProcessing(false);
@@ -2072,6 +2439,84 @@ export default function App() {
   const processDocuments = async () => {
     const filesToProcess = docs.filter(d => d.file).map(d => d.file as File);
     await extractDataFromFiles(filesToProcess);
+  };
+
+  const getLocalImovel = (
+    prop?: PropertyData, 
+    addr?: AddressData, 
+    empList: Empreendimento[] = empreendimentos
+  ): string => {
+    // 1. Prioridade: Cidade e Estado definidos diretamente nos dados do imóvel
+    if (prop?.cidade && prop.cidade.trim()) {
+      const cid = prop.cidade.trim();
+      const uf = (prop.estado || '').trim().toUpperCase();
+      return uf ? `${cid} - ${uf}` : cid;
+    }
+    if (prop?.localizacao && prop.localizacao.trim()) {
+      let loc = prop.localizacao.trim();
+      if (loc.includes('/') && !loc.includes(' - ')) {
+        loc = loc.replace('/', ' - ');
+      }
+      return loc;
+    }
+
+    // 2. Prioridade: Localização cadastrada no Empreendimento correspondente
+    if (prop?.empreendimento && empList && empList.length > 0) {
+      const empNome = prop.empreendimento.trim().toLowerCase();
+      const emp = empList.find(e => e.nome && e.nome.trim().toLowerCase() === empNome);
+      if (emp?.localizacao && emp.localizacao.trim()) {
+        let loc = emp.localizacao.trim();
+        if (loc.includes('/') && !loc.includes(' - ')) {
+          loc = loc.replace('/', ' - ');
+        }
+        return loc;
+      }
+    }
+
+    // 3. Fallback: Se o cadastro do comprador possuir cidade/estado
+    if (addr?.cidade && addr.cidade.trim()) {
+      const cid = addr.cidade.trim();
+      const uf = (addr.estado || '').trim().toUpperCase();
+      return uf ? `${cid} - ${uf}` : cid;
+    }
+
+    // 4. Default de segurança do sistema
+    return 'São Paulo - SP';
+  };
+
+  const getEnderecoEmpreendimento = (
+    prop?: PropertyData, 
+    empList: Empreendimento[] = empreendimentos
+  ): string => {
+    // 1. Endereço explícito do imóvel na proposta
+    if (prop?.endereco && prop.endereco.trim()) {
+      return prop.endereco.trim();
+    }
+    // 2. Busca no cadastro do empreendimento vinculado
+    if (prop?.empreendimento && empList && empList.length > 0) {
+      const empNome = prop.empreendimento.trim().toLowerCase();
+      const emp = empList.find(e => e.nome && e.nome.trim().toLowerCase() === empNome);
+      if (emp) {
+        if (emp.endereco && emp.endereco.trim()) {
+          return emp.endereco.trim();
+        }
+        if (emp.localizacao && emp.localizacao.trim()) {
+          return emp.localizacao.trim();
+        }
+      }
+    }
+    // 3. Localização direta da property
+    if (prop?.localizacao && prop.localizacao.trim()) {
+      return prop.localizacao.trim();
+    }
+    // 4. Cidade / Estado do imóvel
+    if (prop?.cidade && prop.cidade.trim()) {
+      const cid = prop.cidade.trim();
+      const uf = (prop.estado || '').trim().toUpperCase();
+      return uf ? `${cid} - ${uf}` : cid;
+    }
+    // 5. Fallback padrão
+    return 'Endereço conforme memorial de incorporação e projeto aprovado';
   };
 
   const generateFichaCadastral = (data: any) => {
@@ -2394,9 +2839,13 @@ export default function App() {
       forma_pagamento_comissao: ext.forma_pagamento_comissao,
       informacoes_adicionais: ext.informacoes_adicionais,
       documents: ext.documents || [],
-      commissionedParties: loadedParties
+      commissionedParties: loadedParties,
+      manual_waterfall: ext.manual_waterfall
     });
     setCommissionedParties(loadedParties);
+    if ((ext as any).percentualComissao) {
+      setPercentualComissao((ext as any).percentualComissao);
+    }
     if (ext.manual_waterfall) {
       setWaterfallResult(obterRateioConsolidado(ext.manual_waterfall));
       setIsManualRateio(true);
@@ -2560,6 +3009,7 @@ export default function App() {
         nome: '',
         construtora: '',
         localizacao: '',
+        endereco: '',
         tabela_base_id: '',
         status: 'ATIVO',
         regras_comissao: [],
@@ -2593,6 +3043,7 @@ export default function App() {
         nome: emp.nome,
         construtora: emp.construtora || '',
         localizacao: emp.localizacao || '',
+        endereco: emp.endereco || '',
         tabela_base_id: emp.tabela_base_id || '',
         status: emp.status,
         regras_comissao: emp.regras_comissao || [],
@@ -2604,6 +3055,7 @@ export default function App() {
         nome: '',
         construtora: '',
         localizacao: '',
+        endereco: '',
         tabela_base_id: '',
         status: 'ATIVO',
         regras_comissao: [],
@@ -3251,7 +3703,8 @@ export default function App() {
         informacoes_adicionais: result.informacoes_adicionais || '',
         documents: result.documents || [],
         commissioned_parties: commissionedParties,
-        manual_waterfall: isManualRateio ? waterfallResult : null,
+        percentualComissao: percentualComissao,
+        manual_waterfall: waterfallResult || null,
         uid: user.uid,
         updated_at: new Date().toISOString()
       };
@@ -3260,6 +3713,7 @@ export default function App() {
 
       if (result.id) {
         await updateDoc(doc(db, path, result.id), data);
+        setResult(prev => prev ? { ...prev, manual_waterfall: waterfallResult || null } : null);
       } else {
         const docRef = await addDoc(collection(db, path), {
           ...data,
@@ -3267,7 +3721,7 @@ export default function App() {
           created_at: new Date().toISOString()
         });
         // Update local state with new ID
-        setResult(prev => prev ? { ...prev, id: docRef.id } : null);
+        setResult(prev => prev ? { ...prev, id: docRef.id, manual_waterfall: waterfallResult || null } : null);
       }
 
       setSaveStatus('success');
@@ -3762,14 +4216,22 @@ export default function App() {
       return false;
     };
 
+    const formaPagamento = ((data as any)?.forma_pagamento_comissao || (result as any)?.forma_pagamento_comissao || 'PAGADORIA').toString().toUpperCase().trim();
+    const isNFRepasse = formaPagamento.includes('NF') || formaPagamento.includes('REPASSE');
+
     // Elegant Header Style
     doc.setFontSize(14);
     doc.setFont("helvetica", "bold");
     doc.setTextColor(30, 41, 59); // Slate-800
-    doc.text("CONTRATO DE PRESTAÇÃO DE SERVIÇOS", pageWidth / 2, y, { align: "center" });
-    y += 6;
-    doc.text("DE CORRETAGEM IMOBILIÁRIA", pageWidth / 2, y, { align: "center" });
-    y += 12;
+    if (isNFRepasse) {
+      doc.text("CONTRATO DE CORRETAGEM IMOBILIÁRIA", pageWidth / 2, y, { align: "center" });
+      y += 10;
+    } else {
+      doc.text("CONTRATO DE PRESTAÇÃO DE SERVIÇOS", pageWidth / 2, y, { align: "center" });
+      y += 6;
+      doc.text("DE CORRETAGEM IMOBILIÁRIA", pageWidth / 2, y, { align: "center" });
+      y += 12;
+    }
 
     // Section I - Parties
     doc.setFontSize(10);
@@ -3808,7 +4270,7 @@ export default function App() {
     y += splitContratada.length * 5 + 6;
 
     // Section II - Imóvel
-    checkPageBreak(25);
+    checkPageBreak(30);
     doc.setFont("helvetica", "bold");
     doc.setFontSize(10);
     doc.text("II - IMÓVEL", margin, y);
@@ -3828,7 +4290,13 @@ export default function App() {
     const imovelText = `OBJETO DA INTERMEDIAÇÃO: ${identificacaoObjeto}`;
     const splitImovel = doc.splitTextToSize(imovelText, contentWidth);
     doc.text(splitImovel, margin, y);
-    y += splitImovel.length * 4.5 + 6;
+    y += splitImovel.length * 4.5 + 2;
+
+    const enderecoEmp = getEnderecoEmpreendimento(property, empreendimentos);
+    const enderecoText = `ENDEREÇO DO EMPREENDIMENTO: ${enderecoEmp}`;
+    const splitEndereco = doc.splitTextToSize(enderecoText, contentWidth);
+    doc.text(splitEndereco, margin, y);
+    y += splitEndereco.length * 4.5 + 6;
 
     // Section III - Equipe de Vendas
     checkPageBreak(35);
@@ -3837,12 +4305,12 @@ export default function App() {
     doc.text("III - EQUIPE DE VENDAS", margin, y);
     y += 6;
 
-    // Extract active corretores / participants for PDF
-    const activeParties = (data as any).commissionedParties || (data as any).commissioned_parties || commissionedParties || [];
+    // Extract active corretores / participants for PDF (Item III - Equipe de Vendas)
+    const activeParties = (data as any).manual_waterfall?.participantes || (data as any).commissionedParties || (data as any).commissioned_parties || commissionedParties || [];
     const validParties = activeParties.filter((p: any) => {
       if (p.hideAndSum) return false;
-      const rLower = (p.role || '').toLowerCase().trim();
-      if (rLower === 'imobiliária' || rLower === 'imobiliaria') return false;
+      const stateMatch = (commissionedParties || []).find((cp: any) => cp.role?.toLowerCase().trim() === p.role?.toLowerCase().trim());
+      if (stateMatch && (stateMatch as any).hideAndSum) return false;
       return p.name && p.name.trim() !== '' && !p.name.includes('___');
     });
 
@@ -3871,23 +4339,50 @@ export default function App() {
 
         if (match) {
           corretoresPDF.push({
-            cargo: p.role || match.cargo,
+            apelido: match.apelido || match.nome.split(' ')[0] || nameTrimmed.split(' ')[0],
             nome_completo: match.nome,
             cpf_cnpj: match.cpf_cnpj || "___.___.___-__",
-            apelido: match.apelido || match.nome.split(' ')[0],
-            creci: match.creci || "_____-F"
+            creci: match.creci || "_____-F",
+            cargo: p.role || match.cargo || "Participante de Vendas"
           });
         } else {
           corretoresPDF.push({
-            cargo: p.role,
-            nome_completo: nameTrimmed,
-            cpf_cnpj: "___.___.___-__",
             apelido: nameTrimmed.split(' ')[0],
-            creci: "_____-F"
+            nome_completo: nameTrimmed,
+            cpf_cnpj: p.cpf_cnpj || "___.___.___-__",
+            creci: p.creci || "_____-F",
+            cargo: p.role || "Participante de Vendas"
           });
         }
       });
     });
+
+    // Fallback caso não haja participantes configurados na tabela de rateio
+    const hasConfiguredBroker = activeParties.some((p: any) => p.name && p.name.trim() !== '' && !p.name.includes('___'));
+    if (corretoresPDF.length === 0 && !hasConfiguredBroker && salesTeam) {
+      const isCorretorHidden = activeParties.some((p: any) => p.role?.toLowerCase().trim() === 'corretor' && p.hideAndSum);
+      if (!isCorretorHidden && salesTeam.corretor1 && !salesTeam.corretor1.includes('___')) {
+        const match = cargos.find(c => c.nome?.toLowerCase().trim() === salesTeam.corretor1.toLowerCase().trim());
+        corretoresPDF.push({
+          apelido: match?.apelido || salesTeam.corretor1.split(' ')[0],
+          nome_completo: match?.nome || salesTeam.corretor1,
+          cpf_cnpj: match?.cpf_cnpj || "___.___.___-__",
+          creci: match?.creci || "_____-F",
+          cargo: "Corretor Associado"
+        });
+      }
+      const isGerenteHidden = activeParties.some((p: any) => (p.role?.toLowerCase().includes('gerente') || p.role?.toLowerCase().includes('coordenador')) && p.hideAndSum);
+      if (!isGerenteHidden && salesTeam.corretor2 && !salesTeam.corretor2.includes('___')) {
+        const match = cargos.find(c => c.nome?.toLowerCase().trim() === salesTeam.corretor2.toLowerCase().trim());
+        corretoresPDF.push({
+          apelido: match?.apelido || salesTeam.corretor2.split(' ')[0],
+          nome_completo: match?.nome || salesTeam.corretor2,
+          cpf_cnpj: match?.cpf_cnpj || "___.___.___-__",
+          creci: match?.creci || "_____-F",
+          cargo: "Gerente/Coordenador de Vendas"
+        });
+      }
+    }
 
     if (corretoresPDF.length === 0) {
       doc.setFont("helvetica", "italic");
@@ -3897,10 +4392,10 @@ export default function App() {
       doc.setTextColor(30, 41, 59);
       y += 8;
     } else {
-      const headersEquipe = ["Nome", "Apelido", "CPF / CNPJ", "CRECI", "Cargo na Operação"];
+      const headersEquipe = ["Apelido", "Nome Completo ou Razão Social", "CPF / CNPJ", "CRECI", "Função / Cargo"];
       const rowsEquipe = corretoresPDF.map(c => [
-        c.nome_completo,
         c.apelido,
+        c.nome_completo,
         c.cpf_cnpj,
         c.creci,
         c.cargo
@@ -3911,8 +4406,15 @@ export default function App() {
         body: rowsEquipe,
         startY: y,
         margin: { left: margin, right: margin },
-        styles: { fontSize: 8, cellPadding: 2 },
-        headStyles: { fillColor: [51, 65, 85], textColor: [255, 255, 255], fontStyle: "bold" }
+        styles: { fontSize: 8, cellPadding: 2.5 },
+        headStyles: { fillColor: [51, 65, 85], textColor: [255, 255, 255], fontStyle: "bold" },
+        columnStyles: {
+          0: { cellWidth: 28 },
+          1: { cellWidth: 'auto' },
+          2: { cellWidth: 35 },
+          3: { cellWidth: 26 },
+          4: { cellWidth: 32 }
+        }
       });
       y = (doc as any).lastAutoTable.finalY + 8;
     }
@@ -3927,7 +4429,57 @@ export default function App() {
     doc.setFont("helvetica", "normal");
     doc.setFontSize(8.5);
 
-    const pdfClausulas = [
+    const pdfClausulas = isNFRepasse ? [
+      {
+        num: "1.",
+        texto: "O(s) CONTRATANTE(S) deseja(m) comprar a unidade imobiliária indicada no preâmbulo (“Imóvel”);"
+      },
+      {
+        num: "2.",
+        texto: "O(s) CORRETOR (ES) ASSOCIADO (S) qualificados no preâmbulo são corretores de imóveis independentes (“CORRETORES”), que podem associar-se a uma imobiliária para intermediar a negociação de compra do Imóvel, atendendo aos interesses dos compradores interessados em comprá-lo, hipótese em que será realizada a partilha da corretagem, de acordo com o art. 728 do Código Civil e art. 6º, parágrafos 2º e 3º da Lei 6.530/78 (modificada pela Lei 13.097/15);"
+      },
+      {
+        num: "3.",
+        texto: "O(s) CONTRATANTE(S) foram informados do custo total de aquisição do bem, sendo que a quantia descrita acima como \"Valor Total das Comissões\" será destinada ao pagamento dos CORRETORES ASSOCIADOS pela intermediação realizada, valores devidos com a celebração do compromisso de compra e venda."
+      },
+      {
+        num: "4.",
+        texto: "As partes nomeadas e qualificadas no preâmbulo, têm entre si justo e contratado firmar o presente CONTRATO DE CORRETAGEM IMOBILIÁRIA, entre o(s) CONTRATANTE(S) e os CORRETORES, nos seguintes termos:",
+        subitens: [
+          "a). O(s) CONTRATANTE(S) reconhece(m) o serviço e a respectiva remuneração da intermediação imobiliária pela quantia acima descrita, na forma e prazos combinados e descritos na planilha anexa, que integra o presente instrumento para todos os fins de direito.",
+          "b). O valor da intermediação imobiliária será pago pela CONSTRUTORA/INCORPORADORA diretamente para a Imobiliária que será responsável em repassar para os respectivos CORRETORES, os valores que lhes são devidos.",
+          "c). Os CORRETORES estão cientes que a Imobiliária descontará os valores referentes aos tributos que incidam para a emissão da respectiva Nota Fiscal."
+        ]
+      },
+      {
+        num: "5.",
+        texto: "Os CORRETORES participantes deste negócio de compra e venda outorgam-se autorização recíproca para assinatura dos respectivos instrumentos jurídicos e fiscais decorrentes do presente negócio imobiliário. Este Contrato, acompanhado da planilha anexa, é título executivo extrajudicial, sendo os valores de honorários de corretagem considerados dívida líquida, certa e exigível."
+      },
+      {
+        num: "6.",
+        texto: "Nos termos da lei, o(s) CONTRATANTE(S) se declara(m) ciente(s) de que o compromisso ou contrato de compra e venda do Imóvel somente obrigará a incorporadora ou proprietário depois de aceito e assinado pela incorporadora ou proprietário. Portanto, eventuais valores pagos pelo(s) CONTRATANTE(S) não caracterizam sinal ou princípio de pagamento até o aceite da incorporadora ou proprietário no compromisso ou contrato, portanto serão integralmente devolvidos ao(s) CONTRATANTE(S) se o compromisso ou contrato não se concluir."
+      },
+      {
+        num: "7.",
+        texto: "O(s) CONTRATANTE(S) se comprometem a ler detidamente todas as condições dos contratos de memoriais para aquisição do Imóvel antes de assiná-los, principalmente: o compromisso ou contrato de compra e venda do Imóvel, sobretudo no que diz respeito à descrição do Imóvel, condições de pagamento e eventual necessidade de tomada de financiamento para quitação da parcela de chaves, atualização monetária das parcelas e juros aplicáveis, prazo de entrega, cláusulas de rescisão, multas, bem como as plantas e memorial descritivo."
+      },
+      {
+        num: "8.",
+        texto: "O(s) CONTRATANTE(S) desde já autoriza(m) a(s) Instituição(ões) Financeira(s) cessionária(s) dos créditos a efetuar consultas e realizar comunicações junto aos Órgãos de Proteção do Crédito."
+      },
+      {
+        num: "9.",
+        texto: "O(s) CONTRATANTE(S) desde já autoriza(m) a(s) Instituição(ões) Financeira(s) cessionária(s) dos créditos a efetuar consultas e realizar comunicações junto aos Órgãos de Proteção do Crédito."
+      },
+      {
+        num: "10.",
+        texto: "DA ASSINATURA ELETRÔNICA: As partes reconhecem a validade, eficácia e fidedignidade deste instrumento assinado por meio de certificado digital ou plataforma de assinatura eletrônica (tal como Zapsign, DocuSign ou similar), dispensando-se a assinatura física e o reconhecimento de firma em cartório, nos termos da legislação vigente."
+      },
+      {
+        num: "11.",
+        texto: "As Partes elegem o Foro da Comarca da Capital do Estado de São Paulo para conhecer e dirimir quaisquer questões a ele relacionadas, assinando-o eletronicamente na presença de 2 (duas) testemunhas."
+      }
+    ] : [
       {
         num: "1.",
         texto: "O(s) CONTRATANTE(S) deseja(m) comprar a unidade imobiliária indicada no item II (“Imóvel”);"
@@ -3991,7 +4543,7 @@ export default function App() {
     ];
 
     pdfClausulas.forEach((c) => {
-      const fullText = `${c.num} ${c.texto}`;
+      const fullText = `${c.num} ${c.texto.replace(/<\/?strong>/g, '')}`;
       const splitText = doc.splitTextToSize(fullText, contentWidth);
       checkPageBreak(splitText.length * 4.2 + (c.subitens ? 16 : 4));
       doc.text(splitText, margin, y);
@@ -3999,7 +4551,8 @@ export default function App() {
 
       if (c.subitens) {
         c.subitens.forEach(sub => {
-          const splitSub = doc.splitTextToSize(sub, contentWidth - 6);
+          const cleanSub = sub.replace(/<\/?strong>/g, '');
+          const splitSub = doc.splitTextToSize(cleanSub, contentWidth - 6);
           checkPageBreak(splitSub.length * 4.2 + 3);
           doc.text(splitSub, margin + 6, y);
           y += splitSub.length * 4.2 + 2;
@@ -4023,6 +4576,56 @@ export default function App() {
     y += splitCondicoes.length * 4.2 + 6;
 
     // Tables using autotable!
+    // 1. Obter o Rateio Consolidado (Waterfall) para garantir que a comissão no contrato seja rigorosamente a do rateio
+    let contractWaterfall: WaterfallResult | null = null;
+    if ((data as any).manual_waterfall) {
+      contractWaterfall = obterRateioConsolidado((data as any).manual_waterfall);
+    } else if (data === result && waterfallResult) {
+      contractWaterfall = waterfallResult;
+    } else {
+      const sumExcluded = (data.payments || [])
+        .filter(p => isExcludedFromCommissionBase(p.tipo))
+        .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const sumAllParcelas = (data.payments || []).reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : ((data as any).valorTotalProposta || 0)) - sumExcluded);
+      const currentEmp = empreendimentos.find(e => e.nome === property.empreendimento);
+      
+      const pParties = (data as any).commissioned_parties || (data as any).commissionedParties || commissionedParties;
+      const sumCargosPerc = Number((pParties || []).reduce((acc: number, p: any) => acc + (Number(p.percentage) || 0), 0).toFixed(4));
+      const pCommission = sumCargosPerc > 0 
+        ? sumCargosPerc 
+        : ((data as any).percentualComissao !== undefined ? (data as any).percentualComissao : percentualComissao);
+
+      const simParaFluxo = sim || processarProposta(
+        data.payments || [],
+        pCommission,
+        currentEmp?.regras_comissao,
+        installmentConfigs,
+        (data as any).forma_pagamento_comissao || 'PAGADORIA'
+      );
+
+      contractWaterfall = calcularRateioCascata(
+        baseVendaTotal,
+        pCommission,
+        simParaFluxo ? simParaFluxo.fluxo : [],
+        (data as any).forma_pagamento_comissao || 'PAGADORIA',
+        pParties,
+        currentEmp?.regras_comissao
+      );
+    }
+
+    if (!contractWaterfall) {
+      contractWaterfall = {
+        vendaTotal: 0,
+        comissaoTotal: 0,
+        saldoRestanteComissao: 0,
+        participantes: [],
+        detalhesParcelas: []
+      };
+    }
+
+    const comissaoRateioTotal = contractWaterfall.comissaoTotal;
+
     if (sim) {
       const totalProposta = data.payments.reduce((acc, p) => acc + p.valorTotal, 0);
 
@@ -4078,6 +4681,32 @@ export default function App() {
       });
       y = (doc as any).lastAutoTable.finalY + 10;
 
+      // Extrair fluxo líquido e de comissões do Rateio em Cascata (Waterfall)
+      const rateioFluxo = (contractWaterfall && contractWaterfall.detalhesParcelas && contractWaterfall.detalhesParcelas.length > 0)
+        ? contractWaterfall.detalhesParcelas.map(det => ({
+            tipo: det.tipo,
+            vencimento: det.vencimento,
+            valorTotal: det.valorParcela,
+            valorLiquido: Number(Math.max(0, det.valorParcela - det.valorRetido).toFixed(2))
+          }))
+        : (sim ? sim.fluxo : []);
+
+      const condicaoPreco = extrairCondicaoPagamentoDoFluxo(rateioFluxo, 'preco');
+      let condicaoComissao = extrairCondicaoPagamentoDoFluxo(rateioFluxo, 'comissao');
+
+      const totalComissaoExtracted = Number(condicaoComissao.reduce((acc, p) => acc + p.valorTotal, 0).toFixed(2));
+      const diffComissao = Number((comissaoRateioTotal - totalComissaoExtracted).toFixed(2));
+      if (diffComissao > 0.01) {
+        condicaoComissao.push({
+          quantidade: 1,
+          tipo: "Saldo Residual de Comissão",
+          valorUnitario: diffComissao,
+          vencimento: rateioFluxo.length > 0 ? rateioFluxo[rateioFluxo.length - 1].vencimento : "-",
+          vencimentoFinal: rateioFluxo.length > 0 ? rateioFluxo[rateioFluxo.length - 1].vencimento : "-",
+          valorTotal: diffComissao
+        });
+      }
+
       // Table 2: Price
       checkPageBreak(45);
       doc.setFont("helvetica", "bold");
@@ -4087,10 +4716,6 @@ export default function App() {
       y += 4;
 
       const headers2 = ["Qtd", "Tipo de Parcela", "Valor da Parcela", "Vencimento", "Vencimento Final", "Valor Total"];
-      const condicaoPreco = (sim?.condicaoPreco && sim.condicaoPreco.length > 0)
-        ? sim.condicaoPreco
-        : extrairCondicaoPagamentoDoFluxo(sim ? sim.fluxo : [], 'preco');
-
       const rows2 = condicaoPreco.map((p) => [
         `${p.quantidade}x`,
         p.tipo,
@@ -4136,10 +4761,6 @@ export default function App() {
       y += 4;
 
       const headers4 = ["Qtd", "Tipo de Parcela", "Valor da Parcela", "Vencimento", "Vencimento Final", "Valor Total"];
-      const condicaoComissao = (sim?.condicaoComissao && sim.condicaoComissao.length > 0)
-        ? sim.condicaoComissao
-        : extrairCondicaoPagamentoDoFluxo(sim ? sim.fluxo : [], 'comissao');
-
       const rows4 = condicaoComissao.map((p) => [
         `${p.quantidade}x`,
         p.tipo,
@@ -4187,12 +4808,36 @@ export default function App() {
 
     doc.setFont("helvetica", "normal");
     doc.setFontSize(8.5);
-    const splitForo = doc.splitTextToSize("E por estarem assim justas e contratadas, as partes firmam o presente contrato de prestação de serviços de corretagem imobiliária, o qual assinam eletronicamente.", contentWidth);
+    const splitForo = doc.splitTextToSize(
+      isNFRepasse
+        ? "E, por estarem as partes justas e contratadas, assinam o presente CONTRATO DE CORRETAGEM IMOBILIÁRIA eletronicamente na presença de 2 (duas) testemunhas."
+        : "E por estarem assim justas e contratadas, as partes firmam o presente contrato de prestação de serviços de corretagem imobiliária, o qual assinam eletronicamente.",
+      contentWidth
+    );
     doc.text(splitForo, margin, y);
-    y += splitForo.length * 4.5 + 14;
+    y += splitForo.length * 4.5 + 8;
 
-    // Visual Signature fields
-    checkPageBreak(30 + customers.length * 15);
+    // Local e Data (Município/Estado onde o imóvel está localizado)
+    const currentDate = new Date();
+    const meses = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+    const localImovel = getLocalImovel(property, address, empreendimentos);
+    const dataLocal = `${localImovel}, ${currentDate.getDate()} de ${meses[currentDate.getMonth()]} de ${currentDate.getFullYear()}`;
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8.5);
+    doc.setTextColor(71, 85, 105);
+    doc.text("LOCAL E DATA:", margin, y);
+    y += 4.5;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(15, 23, 42);
+    doc.text(dataLocal, margin, y);
+    y += 12;
+
+    // Visual Signature fields (Contratantes e Equipe de Vendas / Corretores Associados)
+    checkPageBreak(40 + (customers.length + corretoresPDF.length) * 15);
+
+    // Linha de assinatura para Contratantes e Imobiliária Contratada
     customers.forEach((cust, idx) => {
       checkPageBreak(25);
       doc.setFont("helvetica", "bold");
@@ -4216,40 +4861,67 @@ export default function App() {
       y += 10;
     });
 
+    // Assinaturas dos Participantes da Venda descritos no Item III
+    if (corretoresPDF.length > 0) {
+      checkPageBreak(25);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8.5);
+      doc.setTextColor(51, 65, 85);
+      doc.text("PARTICIPANTES DA VENDA / EQUIPE DE VENDAS (ITEM III):", margin, y);
+      y += 6;
+      doc.setTextColor(15, 23, 42);
+
+      for (let i = 0; i < corretoresPDF.length; i += 2) {
+        checkPageBreak(28);
+        const c1 = corretoresPDF[i];
+        const c2 = i + 1 < corretoresPDF.length ? corretoresPDF[i + 1] : null;
+
+        doc.setFont("helvetica", "bold");
+        doc.text("______________________________________", margin, y);
+        if (c2) {
+          doc.text("______________________________________", margin + 95, y);
+        }
+        y += 5;
+        doc.setFontSize(8);
+        doc.text((c1.nome_completo || "").toUpperCase(), margin, y);
+        if (c2) {
+          doc.text((c2.nome_completo || "").toUpperCase(), margin + 95, y);
+        }
+        y += 4;
+        doc.setFont("helvetica", "normal");
+        const cargo1 = (c1.cargo || "Participante de Vendas").toUpperCase();
+        doc.text(cargo1, margin, y);
+        if (c2) {
+          const cargo2 = (c2.cargo || "Participante de Vendas").toUpperCase();
+          doc.text(cargo2, margin + 95, y);
+        }
+        y += 4;
+        const cred1 = `CPF/CNPJ: ${c1.cpf_cnpj || '___.___.___-__'}${c1.creci && !c1.creci.includes('____') ? ` - CRECI: ${c1.creci}` : ''}`;
+        doc.text(cred1, margin, y);
+        if (c2) {
+          const cred2 = `CPF/CNPJ: ${c2.cpf_cnpj || '___.___.___-__'}${c2.creci && !c2.creci.includes('____') ? ` - CRECI: ${c2.creci}` : ''}`;
+          doc.text(cred2, margin + 95, y);
+        }
+        y += 11;
+      }
+    }
+
+    // Assinaturas das Testemunhas Instrumentárias (Exigência Contratual)
+    checkPageBreak(30);
+    doc.setFont("helvetica", "bold");
+    doc.text("______________________________________", margin, y);
+    doc.text("______________________________________", margin + 95, y);
+    y += 5;
+    doc.setFontSize(8);
+    doc.text("TESTEMUNHA 1", margin, y);
+    doc.text("TESTEMUNHA 2", margin + 95, y);
+    y += 4;
+    doc.setFont("helvetica", "normal");
+    doc.text("CPF: ___.___.___-__", margin, y);
+    doc.text("CPF: ___.___.___-__", margin + 95, y);
+    y += 10;
+
     // --- ANEXO II - TABELA DE RATEIO ---
-    let contractWaterfall: WaterfallResult | null = null;
-    if ((data as any).manual_waterfall) {
-      contractWaterfall = obterRateioConsolidado((data as any).manual_waterfall);
-    } else {
-      const sumExcluded = (data.payments || [])
-        .filter(p => isExcludedFromCommissionBase(p.tipo))
-        .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-      const baseVendaTotal = Math.max(0, ((data as any).valorTotalProposta || (data.payments || []).reduce((acc, p) => acc + p.valorTotal, 0)) - sumExcluded);
-      const currentEmp = empreendimentos.find(e => e.nome === property.empreendimento);
-      
-      const pCommission = (data as any).percentualComissao !== undefined ? (data as any).percentualComissao : percentualComissao;
-      const pParties = (data as any).commissioned_parties || (data as any).commissionedParties || commissionedParties;
-
-      contractWaterfall = calcularRateioCascata(
-        baseVendaTotal,
-        pCommission,
-        sim ? sim.fluxo : [],
-        (data as any).forma_pagamento_comissao || 'PAGADORIA',
-        pParties,
-        currentEmp?.regras_comissao
-      );
-    }
-
-    if (!contractWaterfall) {
-      contractWaterfall = {
-        vendaTotal: 0,
-        comissaoTotal: 0,
-        saldoRestanteComissao: 0,
-        participantes: [],
-        detalhesParcelas: []
-      };
-    }
-
     doc.addPage();
     y = 20;
 
@@ -4290,7 +4962,7 @@ export default function App() {
       headStyles: { fillColor: [79, 70, 229], textColor: [255, 255, 255], fontStyle: "bold" },
     });
 
-    // Add a new landscape page for Table 2 (now Anexo III)
+    // Add a new landscape page for Table 2 (Anexo II)
     doc.addPage("a4", "l");
     y = 20;
 
@@ -4299,7 +4971,7 @@ export default function App() {
     doc.setFont("helvetica", "bold");
     doc.setFontSize(14);
     doc.setTextColor(30, 41, 59);
-    doc.text("ANEXO III - DETALHAMENTO DE RATEIO CRONOLÓGICO REAL", landscapePageWidth / 2, y, { align: "center" });
+    doc.text("ANEXO II - DETALHAMENTO DE RATEIO CRONOLÓGICO REAL", landscapePageWidth / 2, y, { align: "center" });
     y += 12;
 
     doc.setFont("helvetica", "bold");
@@ -4307,12 +4979,6 @@ export default function App() {
     doc.setTextColor(71, 85, 105);
     doc.text("Detalhamento de Rateio Cronológico Real", margin, y);
     y += 6;
-
-    const headersDetail = [
-      "Vencimento",
-      "Comissão Parcela",
-      ...contractWaterfall.participantes.map(p => p.name ? `${p.role} - ${p.name}` : p.role)
-    ];
 
     let runningSum = 0;
     const visibleParcelas = [];
@@ -4322,10 +4988,10 @@ export default function App() {
         ? sim.fluxo[idx]
         : null;
 
-      const vencimentoToShow = correspondingSimFluxo ? correspondingSimFluxo.vencimento : det.vencimento;
-      const valorComissaoToShow = correspondingSimFluxo 
-        ? Number((correspondingSimFluxo.valorTotal - correspondingSimFluxo.valorLiquido).toFixed(2)) 
-        : det.valorRetido;
+      const vencimentoToShow = det.vencimento || (correspondingSimFluxo ? correspondingSimFluxo.vencimento : '');
+      const valorComissaoToShow = (det.valorRetido > 0 || (data as any).manual_waterfall)
+        ? det.valorRetido
+        : (correspondingSimFluxo ? Number((correspondingSimFluxo.valorTotal - correspondingSimFluxo.valorLiquido).toFixed(2)) : det.valorRetido);
 
       if (valorComissaoToShow > 0) {
         visibleParcelas.push({
@@ -4340,32 +5006,182 @@ export default function App() {
       }
     }
 
+    const headRow1 = [
+      "",
+      "",
+      ...contractWaterfall.participantes.map(p => {
+        const apelido = getParticipantApelido(p.name, corretoresPDF) || (p.role?.toLowerCase().includes('imobili') ? 'R&J' : (p.name ? p.name.split(' ')[0] : ''));
+        return (apelido || p.role).toUpperCase();
+      })
+    ];
+
+    const headRow2 = [
+      "VALOR",
+      "VENCIMENTO",
+      ...contractWaterfall.participantes.map(p => p.role)
+    ];
+
     const rowsDetail = visibleParcelas.map(det => {
       return [
-        det.vencimentoToShow,
         det.valorComissaoToShow.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }),
+        det.vencimentoToShow,
         ...contractWaterfall.participantes.map(p => {
           const label = p.name ? `${p.role} - ${p.name}` : p.role;
           const val = det.distribuicao[label] || 0;
-          return val > 0 ? val.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : "-";
+          return val.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
         })
       ];
     });
 
-    const totalCols = headersDetail.length;
+    const totalComissaoLinhas = visibleParcelas.reduce((acc, d) => acc + d.valorComissaoToShow, 0);
+    const footDetail = [
+      totalComissaoLinhas.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }),
+      "TOTAL",
+      ...contractWaterfall.participantes.map(p => {
+        const label = p.name ? `${p.role} - ${p.name}` : p.role;
+        const totalCol = visibleParcelas.reduce((sum, det) => sum + (det.distribuicao[label] || 0), 0);
+        return totalCol.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+      })
+    ];
+
+    const totalCols = headRow2.length;
     const dynamicFontSize = totalCols > 8 ? 4.2 : totalCols > 6 ? 4.8 : 5.5;
     const dynamicCellPadding = totalCols > 8 ? 0.5 : totalCols > 6 ? 0.7 : 1;
 
+    const colStyles: any = {
+      0: { halign: 'right' },
+      1: { halign: 'center' }
+    };
+    contractWaterfall.participantes.forEach((_, idx) => {
+      colStyles[idx + 2] = { halign: 'right' };
+    });
+
     autoTable(doc, {
-      head: [headersDetail],
+      head: [headRow1, headRow2],
       body: rowsDetail,
+      foot: [footDetail],
       startY: y,
       margin: { left: margin, right: margin },
       styles: { fontSize: dynamicFontSize, cellPadding: dynamicCellPadding, overflow: 'linebreak' },
+      columnStyles: colStyles,
       headStyles: { fillColor: [71, 85, 105], textColor: [255, 255, 255], fontStyle: "bold", fontSize: dynamicFontSize },
+      footStyles: { fillColor: [241, 245, 249], textColor: [15, 23, 42], fontStyle: "bold", fontSize: dynamicFontSize },
+      didParseCell: (hookData) => {
+        if (hookData.section === 'head') {
+          if (hookData.row.index === 0) {
+            if (hookData.column.index === 0 || hookData.column.index === 1) {
+              hookData.cell.styles.fillColor = [248, 250, 252];
+              hookData.cell.styles.textColor = [248, 250, 252];
+            } else {
+              hookData.cell.styles.fillColor = [241, 245, 249];
+              hookData.cell.styles.textColor = [15, 23, 42];
+              hookData.cell.styles.fontStyle = 'bold';
+              hookData.cell.styles.halign = 'right';
+            }
+          } else if (hookData.row.index === 1) {
+            hookData.cell.styles.fillColor = [71, 85, 105];
+            hookData.cell.styles.textColor = [255, 255, 255];
+            hookData.cell.styles.fontStyle = 'bold';
+            if (hookData.column.index === 1) {
+              hookData.cell.styles.halign = 'center';
+            } else {
+              hookData.cell.styles.halign = 'right';
+            }
+          }
+        }
+        if (hookData.section === 'foot') {
+          if (hookData.column.index === 1) {
+            hookData.cell.styles.halign = 'center';
+          } else {
+            hookData.cell.styles.halign = 'right';
+          }
+        }
+      }
     });
 
+    let currentY = (doc as any).lastAutoTable ? (doc as any).lastAutoTable.finalY + 8 : y + 60;
+    
+    // Credenciais dos Participantes na Venda (Rateio)
+    if (currentY > doc.internal.pageSize.getHeight() - 40) {
+      doc.addPage("a4", "l");
+      currentY = 20;
+    }
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8.5);
+    doc.setTextColor(51, 65, 85);
+    doc.text("Credenciais dos Participantes na Venda (Rateio)", margin, currentY);
+    currentY += 4;
+
+    const credHeaders = ["Nome", "Apelido", "CPF / CNPJ", "CRECI", "Cargo na Operação"];
+    const credRows = corretoresPDF.map(c => [c.nome_completo, c.apelido, c.cpf_cnpj, c.creci, c.cargo]);
+
+    autoTable(doc, {
+      head: [credHeaders],
+      body: credRows.length > 0 ? credRows : [["Nenhum participante associado a esta venda", "-", "-", "-", "-"]],
+      startY: currentY,
+      margin: { left: margin, right: margin },
+      styles: { fontSize: 6.5, cellPadding: 1 },
+      headStyles: { fillColor: [241, 245, 249], textColor: [51, 65, 85], fontStyle: "bold", fontSize: 6.5 }
+    });
+
+    currentY = (doc as any).lastAutoTable ? (doc as any).lastAutoTable.finalY + 8 : currentY + 30;
+
+    // Resumo de Cobertura
+    if (currentY > doc.internal.pageSize.getHeight() - 25) {
+      doc.addPage("a4", "l");
+      currentY = 20;
+    }
+
+    const totalDistribuida = contractWaterfall.comissaoTotal - contractWaterfall.saldoRestanteComissao;
+    const saldoRemanescente = contractWaterfall.saldoRestanteComissao;
+
+    doc.setFontSize(8);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(71, 85, 105);
+    doc.text(
+      `Total Comissão Distribuída: ${totalDistribuida.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}   |   Saldo Remanescente Sem Cobertura: ${saldoRemanescente > 0.05 ? saldoRemanescente.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : 'R$ 0,00 (100% Coberta)'}`,
+      margin,
+      currentY
+    );
+
     return doc;
+  };
+
+  const getContractFileName = (property: any) => {
+    const sanitize = (val: any) => (val || '')
+      .toString()
+      .trim()
+      .replace(/[/\\?%*:|"<>]/g, '-')
+      .replace(/\s+/g, ' ');
+
+    const unidade = sanitize(property?.unidade);
+    const torreBloco = sanitize(property?.torre);
+    const empreendimento = sanitize(property?.empreendimento);
+
+    const parts = [unidade, torreBloco, empreendimento].filter(Boolean);
+    const prefix = parts.length > 0 ? parts.join('_') : 'IMOVEL';
+    return `${prefix}-CONTRATO DE CORRETAGEM.pdf`;
+  };
+
+  const downloadContractPDF = (data: any = result) => {
+    if (!data) {
+      showToast("Nenhuma proposta selecionada para baixar o contrato.", "info");
+      return;
+    }
+    try {
+      const doc = generateContractPDFContent(data, simulationResult);
+      if (!doc) {
+        showToast("Não foi possível gerar o PDF do contrato.", "error");
+        return;
+      }
+      const fileName = getContractFileName(data.property);
+      doc.save(fileName);
+      showToast("Contrato baixado em PDF com sucesso!", "success");
+    } catch (err) {
+      console.error("Erro ao baixar contrato em PDF:", err);
+      showToast("Erro ao baixar o contrato em PDF.", "error");
+    }
   };
 
   const saveAssinafySettings = (token: string, sandbox: boolean) => {
@@ -4489,7 +5305,7 @@ export default function App() {
         fileName = `Ficha_Proposta_${result.property?.unidade || 'Unidade'}_${result.customers?.[0]?.nome?.split(' ')[0] || 'Cliente'}.pdf`;
       } else {
         pdfDoc = generateContractPDFContent(result, simulationResult);
-        fileName = `Contrato_Intermediacao_${result.property?.unidade || 'Unidade'}_${result.customers?.[0]?.nome?.split(' ')[0] || 'Cliente'}.pdf`;
+        fileName = getContractFileName(result.property);
       }
       
       if (!pdfDoc) {
@@ -4655,16 +5471,16 @@ export default function App() {
       property.torre ? `Torre/Bloco ${property.torre}` : ''
     ].filter(Boolean).join(' - ') || "__________________________________________________";
 
-    // Corretores associados vindos do rateio com enriquecimento de dados a partir da Lista de Cargos (base de cadastros)
+    const enderecoEmpreendimento = getEnderecoEmpreendimento(property, empreendimentos);
+
+    // Corretores associados e participantes da venda vindos do rateio (Item III - Equipe de Vendas)
     let corretores: Array<{ cargo: string; nome_completo: string; cpf_cnpj: string; apelido: string; creci: string }> = [];
 
-    const activeParties = (data as any).commissionedParties || (data as any).commissioned_parties || commissionedParties || [];
+    const activeParties = (data as any).manual_waterfall?.participantes || (data as any).commissionedParties || (data as any).commissioned_parties || commissionedParties || [];
     const validParties = activeParties.filter((p: any) => {
       if (p.hideAndSum) return false;
       const stateMatch = (commissionedParties || []).find((cp: any) => cp.role?.toLowerCase().trim() === p.role?.toLowerCase().trim());
       if (stateMatch && (stateMatch as any).hideAndSum) return false;
-      const rLower = (p.role || '').toLowerCase().trim();
-      if (rLower === 'imobiliária' || rLower === 'imobiliaria') return false;
       return p.name && p.name.trim() !== '' && !p.name.includes('___');
     });
 
@@ -4675,7 +5491,7 @@ export default function App() {
           const nameTrimmed = n.trim();
           if (!nameTrimmed) return;
           
-          // Se o corretor/participante já existir na lista, compor o cargo da operação com os cargos atribuídos a ele no rateio
+          // Se o participante já existir na lista, compor os cargos
           const existing = corretores.find(c => c.nome_completo.toLowerCase().trim() === nameTrimmed.toLowerCase());
           if (existing) {
             const currentRoles = existing.cargo.split(',').map((r: string) => r.trim().toLowerCase());
@@ -4694,46 +5510,48 @@ export default function App() {
 
           if (match) {
             corretores.push({
-              cargo: p.role || match.cargo,
+              apelido: match.apelido || match.nome.split(' ')[0] || nameTrimmed.split(' ')[0],
               nome_completo: match.nome,
               cpf_cnpj: match.cpf_cnpj || "___.___.___-__",
-              apelido: match.apelido || match.nome.split(' ')[0],
-              creci: match.creci || "_______"
+              creci: match.creci || "_____-F",
+              cargo: p.role || match.cargo || "Participante de Vendas"
             });
           } else {
             corretores.push({
-              cargo: p.role,
-              nome_completo: nameTrimmed,
-              cpf_cnpj: "___.___.___-__",
               apelido: nameTrimmed.split(' ')[0],
-              creci: "_______"
+              nome_completo: nameTrimmed,
+              cpf_cnpj: p.cpf_cnpj || "___.___.___-__",
+              creci: p.creci || "_____-F",
+              cargo: p.role || "Participante de Vendas"
             });
           }
         });
       });
     }
 
-    // Fallback para os campos de preenchimento padrão da proposta caso não haja nenhum participante configurado
+    // Fallback para os campos de preenchimento padrão da proposta caso não haja nenhum participante configurado no rateio
     const hasConfiguredBroker = activeParties.some((p: any) => p.name && p.name.trim() !== '' && !p.name.includes('___'));
-    if (corretores.length === 0 && !hasConfiguredBroker) {
+    if (corretores.length === 0 && !hasConfiguredBroker && salesTeam) {
       const isCorretorHidden = activeParties.some((p: any) => p.role?.toLowerCase().trim() === 'corretor' && p.hideAndSum);
-      if (!isCorretorHidden && salesTeam.corretor1) {
+      if (!isCorretorHidden && salesTeam.corretor1 && !salesTeam.corretor1.includes('___')) {
+        const match1 = cargos.find(c => c.nome?.toLowerCase().trim() === salesTeam.corretor1.toLowerCase().trim());
         corretores.push({
-          cargo: "Corretor Associado",
-          apelido: salesTeam.corretor1 ? salesTeam.corretor1.split(' ')[0] : "Corretor",
-          nome_completo: salesTeam.corretor1,
-          cpf_cnpj: "___.___.___-__",
-          creci: "_______"
+          apelido: match1?.apelido || salesTeam.corretor1.split(' ')[0],
+          nome_completo: match1?.nome || salesTeam.corretor1,
+          cpf_cnpj: match1?.cpf_cnpj || "___.___.___-__",
+          creci: match1?.creci || "_____-F",
+          cargo: "Corretor Associado"
         });
       }
       const isGerenteHidden = activeParties.some((p: any) => (p.role?.toLowerCase().includes('gerente') || p.role?.toLowerCase().includes('coordenador')) && p.hideAndSum);
-      if (!isGerenteHidden && salesTeam.corretor2) {
+      if (!isGerenteHidden && salesTeam.corretor2 && !salesTeam.corretor2.includes('___')) {
+        const match2 = cargos.find(c => c.nome?.toLowerCase().trim() === salesTeam.corretor2.toLowerCase().trim());
         corretores.push({
-          cargo: "Gerente/Coordenador de Vendas",
-          apelido: salesTeam.corretor2.split(' ')[0],
-          nome_completo: salesTeam.corretor2,
-          cpf_cnpj: "___.___.___-__",
-          creci: "_______"
+          apelido: match2?.apelido || salesTeam.corretor2.split(' ')[0],
+          nome_completo: match2?.nome || salesTeam.corretor2,
+          cpf_cnpj: match2?.cpf_cnpj || "___.___.___-__",
+          creci: match2?.creci || "_____-F",
+          cargo: "Gerente/Coordenador de Vendas"
         });
       }
     }
@@ -4742,30 +5560,37 @@ export default function App() {
 
     const currentDate = new Date();
     const meses = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
-    const dataLocal = `${address.cidade || 'São Paulo'} - ${address.estado || 'SP'}, ${currentDate.getDate()} de ${meses[currentDate.getMonth()]} de ${currentDate.getFullYear()}`;
+    const localImovel = getLocalImovel(property, address, empreendimentos);
+    const dataLocal = `${localImovel}, ${currentDate.getDate()} de ${meses[currentDate.getMonth()]} de ${currentDate.getFullYear()}`;
 
     // Executar simulação de comissão e fluxo consolidado para o Anexo I
     const currentEmp = empreendimentos.find(e => e.nome === property.empreendimento);
+    const pParties = (data as any).commissioned_parties || (data as any).commissionedParties || commissionedParties;
+    const sumCargosPerc = Number((pParties || []).reduce((acc: number, p: any) => acc + (Number(p.percentage) || 0), 0).toFixed(4));
+    const pCommission = sumCargosPerc > 0 
+      ? sumCargosPerc 
+      : ((data as any).percentualComissao !== undefined ? (data as any).percentualComissao : percentualComissao);
+
     const sim = processarProposta(
       data.payments || [], 
-      percentualComissao, 
+      pCommission, 
       currentEmp?.regras_comissao, 
       installmentConfigs,
       (data as any).forma_pagamento_comissao || 'PAGADORIA'
     );
 
-    // Executar rateio de cascata (waterfall) para o Anexo II
+    // Executar rateio de cascata (waterfall) para o Anexo II e Anexo III
     let contractWaterfall: WaterfallResult | null = null;
     if ((data as any).manual_waterfall) {
       contractWaterfall = obterRateioConsolidado((data as any).manual_waterfall);
+    } else if (data === result && waterfallResult) {
+      contractWaterfall = waterfallResult;
     } else {
       const sumExcluded = (data.payments || [])
         .filter(p => isExcludedFromCommissionBase(p.tipo))
         .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-      const baseVendaTotal = Math.max(0, ((data as any).valorTotalProposta || (data.payments || []).reduce((acc, p) => acc + p.valorTotal, 0)) - sumExcluded);
-      
-      const pCommission = (data as any).percentualComissao !== undefined ? (data as any).percentualComissao : percentualComissao;
-      const pParties = (data as any).commissioned_parties || (data as any).commissionedParties || commissionedParties;
+      const sumAllParcelas = (data.payments || []).reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : ((data as any).valorTotalProposta || 0)) - sumExcluded);
 
       contractWaterfall = calcularRateioCascata(
         baseVendaTotal,
@@ -4787,9 +5612,10 @@ export default function App() {
       };
     }
 
+    const comissaoRateioTotal = contractWaterfall.comissaoTotal;
     const formattedTotalProposta = formatCurrency(totalValue);
-    const formattedTotalComissoes = formatCurrency(sim.comissaoTotal);
-    const formattedTotalImovel = formatCurrency(totalValue - sim.comissaoTotal);
+    const formattedTotalComissoes = formatCurrency(comissaoRateioTotal);
+    const formattedTotalImovel = formatCurrency(Math.max(0, totalValue - comissaoRateioTotal));
 
     const payments = data.payments || [];
 
@@ -4803,58 +5629,80 @@ export default function App() {
 
       return `
         <tr>
-          <td style="text-align: center; font-family: monospace;">${p.quantidade}x</td>
-          <td><strong>${p.tipo}</strong></td>
-          <td style="text-align: right; font-family: monospace; color: #475569;">${formatCurrency(p.valorUnitario || 0)}</td>
-          <td style="text-align: center; font-family: monospace; color: #475569;">${p.vencimento || '-'}</td>
-          <td style="text-align: center; font-family: monospace; color: #475569;">${vencimentoFinal}</td>
-          <td style="text-align: right; font-weight: bold; color: #0f172a;">${formatCurrency(p.valorTotal || 0)}</td>
+          <td style="text-align: center; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.quantidade}x</td>
+          <td style="font-size: 12px; font-family: Arial, Helvetica, sans-serif;"><strong>${p.tipo}</strong></td>
+          <td style="text-align: right; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${formatCurrency(p.valorUnitario || 0)}</td>
+          <td style="text-align: center; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.vencimento || '-'}</td>
+          <td style="text-align: center; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${vencimentoFinal}</td>
+          <td style="text-align: right; font-weight: bold; color: #0f172a; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${formatCurrency(p.valorTotal || 0)}</td>
         </tr>
       `;
     }).join('');
 
-    const condicaoPreco = (sim?.condicaoPreco && sim.condicaoPreco.length > 0)
-      ? sim.condicaoPreco
-      : extrairCondicaoPagamentoDoFluxo(sim ? sim.fluxo : [], 'preco');
-    const totalPrecoGeral = condicaoPreco.reduce((acc, p) => acc + p.valorTotal, 0);
+    // Extrair fluxo líquido e de comissões do Rateio (Waterfall)
+    const rateioFluxo = (contractWaterfall && contractWaterfall.detalhesParcelas && contractWaterfall.detalhesParcelas.length > 0)
+      ? contractWaterfall.detalhesParcelas.map(det => ({
+          tipo: det.tipo,
+          vencimento: det.vencimento,
+          valorTotal: det.valorParcela,
+          valorLiquido: Number(Math.max(0, det.valorParcela - det.valorRetido).toFixed(2))
+        }))
+      : (sim ? sim.fluxo : []);
+
+    const condicaoPreco = extrairCondicaoPagamentoDoFluxo(rateioFluxo, 'preco');
+    let condicaoComissao = extrairCondicaoPagamentoDoFluxo(rateioFluxo, 'comissao');
+
+    const totalComissaoExtracted = Number(condicaoComissao.reduce((acc, p) => acc + p.valorTotal, 0).toFixed(2));
+    const diffComissao = Number((comissaoRateioTotal - totalComissaoExtracted).toFixed(2));
+    if (diffComissao > 0.01) {
+      condicaoComissao.push({
+        quantidade: 1,
+        tipo: "Saldo Residual de Comissão",
+        valorUnitario: diffComissao,
+        vencimento: rateioFluxo.length > 0 ? rateioFluxo[rateioFluxo.length - 1].vencimento : "-",
+        vencimentoFinal: rateioFluxo.length > 0 ? rateioFluxo[rateioFluxo.length - 1].vencimento : "-",
+        valorTotal: diffComissao
+      });
+    }
+
+    const totalPrecoGeral = Number(condicaoPreco.reduce((acc, p) => acc + p.valorTotal, 0).toFixed(2));
+    const totalComissaoGeral = Number(condicaoComissao.reduce((acc, p) => acc + p.valorTotal, 0).toFixed(2));
+    const totalPropostaGeral = payments.reduce((acc, p) => acc + (p.valorTotal || 0), 0);
 
     const condicaoPagamentoPrecoRows = condicaoPreco.map(p => `
       <tr>
-        <td style="text-align: center; font-family: monospace;">${p.quantidade}x</td>
-        <td><strong>${p.tipo}</strong></td>
-        <td style="text-align: right; font-family: monospace; color: #475569;">${formatCurrency(p.valorUnitario)}</td>
-        <td style="text-align: center; font-family: monospace; color: #475569;">${p.vencimento || '-'}</td>
-        <td style="text-align: center; font-family: monospace; color: #475569;">${p.vencimentoFinal || p.vencimento || '-'}</td>
-        <td style="text-align: right; font-weight: bold; color: #1e1b4b;">${formatCurrency(p.valorTotal)}</td>
+        <td style="text-align: center; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.quantidade}x</td>
+        <td style="font-size: 12px; font-family: Arial, Helvetica, sans-serif;"><strong>${p.tipo}</strong></td>
+        <td style="text-align: right; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${formatCurrency(p.valorUnitario)}</td>
+        <td style="text-align: center; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.vencimento || '-'}</td>
+        <td style="text-align: center; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.vencimentoFinal || p.vencimento || '-'}</td>
+        <td style="text-align: right; font-weight: bold; color: #1e1b4b; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${formatCurrency(p.valorTotal)}</td>
       </tr>
     `).join('');
-
-    const totalPropostaGeral = payments.reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-
-    const condicaoComissao = (sim?.condicaoComissao && sim.condicaoComissao.length > 0)
-      ? sim.condicaoComissao
-      : extrairCondicaoPagamentoDoFluxo(sim ? sim.fluxo : [], 'comissao');
-    const totalComissaoGeral = condicaoComissao.reduce((acc, p) => acc + p.valorTotal, 0);
 
     const condicaoPagamentoComissaoRows = condicaoComissao.map(p => `
       <tr>
-        <td style="text-align: center; font-family: monospace;">${p.quantidade}x</td>
-        <td><strong>${p.tipo}</strong></td>
-        <td style="text-align: right; font-family: monospace; color: #475569;">${formatCurrency(p.valorUnitario)}</td>
-        <td style="text-align: center; font-family: monospace; color: #475569;">${p.vencimento || '-'}</td>
-        <td style="text-align: center; font-family: monospace; color: #475569;">${p.vencimentoFinal || p.vencimento || '-'}</td>
-        <td style="text-align: right; font-weight: bold; color: #b45309;">${formatCurrency(p.valorTotal)}</td>
+        <td style="text-align: center; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.quantidade}x</td>
+        <td style="font-size: 12px; font-family: Arial, Helvetica, sans-serif;"><strong>${p.tipo}</strong></td>
+        <td style="text-align: right; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${formatCurrency(p.valorUnitario)}</td>
+        <td style="text-align: center; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.vencimento || '-'}</td>
+        <td style="text-align: center; color: #475569; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${p.vencimentoFinal || p.vencimento || '-'}</td>
+        <td style="text-align: right; font-weight: bold; color: #b45309; font-size: 12px; font-family: Arial, Helvetica, sans-serif;">${formatCurrency(p.valorTotal)}</td>
       </tr>
     `).join('');
 
+    const formaPagamento = ((data as any)?.forma_pagamento_comissao || (result as any)?.forma_pagamento_comissao || 'PAGADORIA').toString().toUpperCase().trim();
+    const isNFRepasse = formaPagamento.includes('NF') || formaPagamento.includes('REPASSE');
+
     // CONTRATO MODELO JSON solicitado pelo usuário
     const contractModel = {
-      titulo: "CONTRATO DE PRESTAÇÃO DE SERVIÇOS DE CORRETAGEM IMOBILIÁRIA",
+      titulo: isNFRepasse ? "CONTRATO DE CORRETAGEM IMOBILIÁRIA" : "CONTRATO DE PRESTAÇÃO DE SERVIÇOS DE CORRETAGEM IMOBILIÁRIA",
       preambulo: {
         contratante: firstContratante,
         contratantes: contratantes,
         objeto: {
-          identificacao: identificacaoObjeto
+          identificacao: identificacaoObjeto,
+          endereco: enderecoEmpreendimento
         },
         contratada: {
           razao_social: razaoSocialContratada,
@@ -4866,7 +5714,57 @@ export default function App() {
         },
         corretores_associados: corretores
       },
-      clausulas: [
+      clausulas: isNFRepasse ? [
+        {
+          numero: 1,
+          texto: "O(s) CONTRATANTE(S) deseja(m) comprar a unidade imobiliária indicada no preâmbulo (“Imóvel”);"
+        },
+        {
+          numero: 2,
+          texto: "O(s) CORRETOR (ES) ASSOCIADO (S) qualificados no preâmbulo são corretores de imóveis independentes (“CORRETORES”), que podem associar-se a uma imobiliária para intermediar a negociação de compra do Imóvel, atendendo aos interesses dos compradores interessados em comprá-lo, hipótese em que será realizada a partilha da corretagem, de acordo com o art. 728 do Código Civil e art. 6º, parágrafos 2º e 3º da Lei 6.530/78 (modificada pela Lei 13.097/15);"
+        },
+        {
+          numero: 3,
+          texto: "O(s) CONTRATANTE(S) foram informados do custo total de aquisição do bem, sendo que a quantia descrita acima como \"Valor Total das Comissões\" será destinada ao pagamento dos CORRETORES ASSOCIADOS pela intermediação realizada, valores devidos com a celebração do compromisso de compra e venda."
+        },
+        {
+          numero: 4,
+          texto: "As partes nomeadas e qualificadas no preâmbulo, têm entre si justo e contratado firmar o presente CONTRATO DE CORRETAGEM IMOBILIÁRIA, entre o(s) CONTRATANTE(S) e os CORRETORES, nos seguintes termos:",
+          subitens: [
+            "<strong>a).</strong> O(s) CONTRATANTE(S) reconhece(m) o serviço e a respectiva remuneração da intermediação imobiliária pela quantia acima descrita, na forma e prazos combinados e descritos na planilha anexa, que integra o presente instrumento para todos os fins de direito.",
+            "<strong>b).</strong> O valor da intermediação imobiliária será pago pela CONSTRUTORA/INCORPORADORA diretamente para a Imobiliária que será responsável em repassar para os respectivos CORRETORES, os valores que lhes são devidos.",
+            "<strong>c).</strong> Os CORRETORES estão cientes que a Imobiliária descontará os valores referentes aos tributos que incidam para a emissão da respectiva Nota Fiscal."
+          ]
+        },
+        {
+          numero: 5,
+          texto: "Os CORRETORES participantes deste negócio de compra e venda outorgam-se autorização recíproca para assinatura dos respectivos instrumentos jurídicos e fiscais decorrentes do presente negócio imobiliário. Este Contrato, acompanhado da planilha anexa, é título executivo extrajudicial, sendo os valores de honorários de corretagem considerados dívida líquida, certa e exigível."
+        },
+        {
+          numero: 6,
+          texto: "Nos termos da lei, o(s) CONTRATANTE(S) se declara(m) ciente(s) de que o compromisso ou contrato de compra e venda do Imóvel somente obrigará a incorporadora ou proprietário depois de aceito e assinado pela incorporadora ou proprietário. Portanto, eventuais valores pagos pelo(s) CONTRATANTE(S) não caracterizam sinal ou princípio de pagamento até o aceite da incorporadora ou proprietário no compromisso ou contrato, portanto serão integralmente devolvidos ao(s) CONTRATANTE(S) se o compromisso ou contrato não se concluir."
+        },
+        {
+          numero: 7,
+          texto: "O(s) CONTRATANTE(S) se comprometem a ler detidamente todas as condições dos contratos de memoriais para aquisição do Imóvel antes de assiná-los, principalmente: o compromisso ou contrato de compra e venda do Imóvel, sobretudo no que diz respeito à descrição do Imóvel, condições de pagamento e eventual necessidade de tomada de financiamento para quitação da parcela de chaves, atualização monetária das parcelas e juros aplicáveis, prazo de entrega, cláusulas de rescisão, multas, bem como as plantas e memorial descritivo."
+        },
+        {
+          numero: 8,
+          texto: "O(s) CONTRATANTE(S) desde já autoriza(m) a(s) Instituição(ões) Financeira(s) cessionária(s) dos créditos a efetuar consultas e realizar comunicações junto aos Órgãos de Proteção do Crédito."
+        },
+        {
+          numero: 9,
+          texto: "O(s) CONTRATANTE(S) desde já autoriza(m) a(s) Instituição(ões) Financeira(s) cessionária(s) dos créditos a efetuar consultas e realizar comunicações junto aos Órgãos de Proteção do Crédito."
+        },
+        {
+          numero: 10,
+          texto: "<strong>DA ASSINATURA ELETRÔNICA:</strong> As partes reconhecem a validade, eficácia e fidedignidade deste instrumento assinado por meio de certificado digital ou plataforma de assinatura eletrônica (tal como Zapsign, DocuSign ou similar), dispensando-se a assinatura física e o reconhecimento de firma em cartório, nos termos da legislação vigente."
+        },
+        {
+          numero: 11,
+          texto: "As Partes elegem o Foro da Comarca da Capital do Estado de São Paulo para conhecer e dirimir quaisquer questões a ele relacionadas, assinando-o eletronicamente na presença de 2 (duas) testemunhas."
+        }
+      ] : [
         {
           numero: 1,
           texto: "O(s) CONTRATANTE(S) deseja(m) comprar a unidade imobiliária indicada no item II (“Imóvel”);"
@@ -4997,20 +5895,29 @@ export default function App() {
       </tr>
     `).join('');
 
+    const contractDocTitle = getContractFileName(property).replace(/\.pdf$/i, '');
+
     const html = `
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>${contractModel.titulo}</title>
+    <title>${contractDocTitle}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,600;0,700;1,400&display=swap');
-        @page { size: A4; margin: 2.0cm 1.5cm; }
+        @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800;900&family=Inter:wght@400;500;600;700&display=swap');
+
+        @page { 
+            size: A4; 
+            margin: 15mm; 
+        }
         * { box-sizing: border-box; }
         body { 
-            font-family: 'Inter', sans-serif; 
-            margin: 0; padding: 20px; color: #1e293b; 
-            line-height: 1.6; font-size: 11px; 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            margin: 0; padding: 20px; color: #0f172a; 
+            line-height: 1.5; font-size: 12pt; 
             background-color: #f1f5f9; 
         }
         .toolbar { 
@@ -5022,7 +5929,7 @@ export default function App() {
         .btn { 
             padding: 8px 24px; border: none; border-radius: 6px; 
             cursor: pointer; font-weight: bold; text-transform: uppercase; 
-            font-size: 11px; color: white; transition: all 0.2s ease;
+            font-size: 11pt; color: white; transition: all 0.2s ease;
             font-family: 'Inter', sans-serif;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
@@ -5031,230 +5938,301 @@ export default function App() {
         .btn-close { background: #64748b; }
         .btn-close:hover { background: #475569; transform: translateY(-1px); }
         
-        .contract-wrapper { 
-            margin: 60px auto 20px; 
+        .page-sheet { 
+            margin: 40px auto 20px; 
             background: white; 
-            padding: 60px 70px; 
-            max-width: 800px; 
-            box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1);
-            border-radius: 8px;
-            border: 1px solid #e2e8f0;
+            padding: 15mm 20mm; 
+            max-width: 210mm; 
+            min-height: 297mm;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08); 
+            border-radius: 4px; 
+            border: 1px solid #e2e8f0; 
+            box-sizing: border-box; 
+            font-family: 'Inter', sans-serif; 
+            font-size: 12pt; 
+            line-height: 1.5; 
+            color: #0f172a;
+            position: relative;
+        }
+        .page-break {
+            page-break-before: always;
+            break-before: page;
+        }
+        .avoid-break {
+            page-break-inside: avoid;
+            break-inside: avoid;
+        }
+        .contract-logo {
+            display: block;
+            margin: 0 auto 10px auto;
+            max-height: 70px;
+            width: auto;
+            object-fit: contain;
         }
         .title { 
-            font-size: 15px; 
+            font-family: 'Cinzel', Georgia, serif;
+            font-size: 16.5pt; 
             font-weight: 700; 
             color: #0f172a; 
             text-align: center; 
-            margin-bottom: 35px; 
+            margin-bottom: 4px; 
             text-transform: uppercase;
-            line-height: 1.5;
-            border-bottom: 2px solid #0d9488;
-            padding-bottom: 16px;
-            font-family: 'Playfair Display', serif;
+            line-height: 1.3;
+            letter-spacing: 0.8px;
+        }
+        .subtitle {
+            font-family: 'Inter', sans-serif;
+            font-size: 9.5pt;
+            font-weight: 600;
+            color: #64748b;
+            text-align: center;
+            margin-bottom: 14px;
+            text-transform: uppercase;
             letter-spacing: 0.5px;
         }
         .section-header {
-            font-family: 'Playfair Display', serif;
-            font-size: 12px;
-            font-weight: 700;
-            color: #0f172a;
+            font-family: 'Cinzel', Georgia, serif;
+            font-size: 12.5pt;
+            font-weight: 700; 
+            color: #0f172a; 
             text-transform: uppercase;
-            margin-top: 30px;
-            margin-bottom: 12px;
-            border-bottom: 1px solid #cbd5e1;
-            padding-bottom: 6px;
+            margin-top: 14px;
+            margin-bottom: 8px;
+            border-left: 4px solid #0f172a;
+            padding-left: 8px;
             letter-spacing: 0.5px;
+            line-height: 1.2;
         }
         .grid-preambulo {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 20px;
+            gap: 8px;
+            margin-bottom: 8px;
             background: #f8fafc;
-            padding: 18px;
-            border-radius: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
             border: 1px solid #e2e8f0;
+            font-family: 'Inter', sans-serif;
+            font-size: 9.5pt;
+            line-height: 1.35;
         }
         .grid-col {
-            margin-bottom: 8px;
-            font-size: 11px;
+            margin-bottom: 3px;
+            font-size: 9.5pt;
+            font-family: 'Inter', sans-serif;
         }
         .label {
-            font-weight: 600;
-            color: #475569;
-            font-size: 10px;
+            font-weight: 700; 
+            color: #334155;
+            font-size: 9.5pt;
             text-transform: uppercase;
-            margin-right: 6px;
+            margin-right: 5px;
+            font-family: 'Inter', sans-serif;
         }
         .value {
             color: #0f172a;
+            font-size: 9.5pt;
+            font-family: 'Inter', sans-serif;
         }
-        .text-justify {
+        .text-justify, p, .clausula-content {
             text-align: justify;
-            text-indent: 2em;
-            margin-bottom: 12px;
-            font-size: 11px;
-            color: #334155;
-        }
-        ol {
-            margin-left: 20px;
-            margin-bottom: 15px;
-            text-align: justify;
-            color: #334155;
-        }
-        li {
-            margin-bottom: 8px;
-        }
-        .clausula-title {
-            font-weight: 700;
+            font-size: 12pt;
+            font-weight: 400;
             color: #0f172a;
-            margin-top: 20px;
-            margin-bottom: 8px;
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
+            font-family: 'Inter', sans-serif;
+            line-height: 1.5;
+            margin-bottom: 12px;
+        }
+        .clausula-item {
+            margin-bottom: 12px;
+            font-family: 'Inter', sans-serif;
+            font-size: 12pt;
+            font-weight: 400;
+            line-height: 1.5;
+        }
+        .alinea-item {
+            margin-left: 20px;
+            margin-top: 5px;
+            text-align: justify;
+            line-height: 1.5;
+            font-size: 12pt;
+            font-family: 'Inter', sans-serif;
         }
         .signatures-section {
-            margin-top: 50px;
+            margin-top: 20px;
             page-break-inside: avoid;
+            break-inside: avoid;
+            font-family: 'Inter', sans-serif;
         }
         .signatures-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 40px;
-            margin-top: 30px;
+            gap: 20px;
+            margin-top: 15px;
+            page-break-inside: avoid;
+            break-inside: avoid;
         }
         .signature-box {
             text-align: center;
-            border-top: 1px solid #cbd5e1;
-            padding-top: 10px;
-            margin-top: 30px;
-            font-size: 10px;
+            border-top: 1px solid #0f172a;
+            padding-top: 6px;
+            margin-top: 15px;
+            font-size: 9.5pt;
+            font-family: 'Inter', sans-serif;
+            page-break-inside: avoid;
+            break-inside: avoid;
         }
         .signature-title {
-            font-weight: 600;
-            color: #475569;
+            font-weight: 700; 
+            color: #64748b;
             text-transform: uppercase;
-            font-size: 9px;
+            font-size: 8.5pt;
             letter-spacing: 0.5px;
-        }
-        .anexo-wrapper {
-            margin-top: 60px;
-            border-top: 3px double #cbd5e1;
-            padding-top: 50px;
-            page-break-before: always;
+            font-family: 'Inter', sans-serif;
         }
         .anexo-title {
-            font-family: 'Playfair Display', serif;
-            font-size: 14px;
-            font-weight: 700;
-            color: #0f172a;
-            text-align: center;
-            margin-bottom: 25px;
+            font-family: 'Cinzel', Georgia, serif;
+            font-size: 12.5pt;
+            font-weight: 700; 
+            color: #0f172a; 
+            text-align: left;
+            margin-bottom: 8px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+            border-left: 4px solid #0f172a;
+            padding-left: 8px;
         }
-        table {
+        table.table-dados {
             width: 100%;
             border-collapse: collapse;
-            margin: 15px 0;
-            font-size: 10.5px;
+            margin-top: 4px;
+            margin-bottom: 8px;
+            font-family: 'Inter', sans-serif;
+            font-size: 9.5pt;
         }
-        th, td {
+        table.table-dados th {
+            background: #0f172a;
+            color: #ffffff;
+            font-weight: 700;
+            font-size: 8.5pt;
+            text-transform: uppercase;
+            padding: 5px 8px;
             border: 1px solid #cbd5e1;
-            padding: 8px 12px;
             text-align: left;
         }
-        th {
-            background-color: #f8fafc;
-            color: #334155;
-            font-weight: 600;
-            font-size: 10px;
-            text-transform: uppercase;
+        table.table-dados td {
+            padding: 4px 8px;
+            border: 1px solid #cbd5e1;
+            font-size: 9.5pt;
+            color: #0f172a;
+            text-align: left;
         }
-        .total-highlight {
-            font-weight: 700;
-            background-color: #f8fafc;
-            font-size: 11px;
-        }
-        .compact-table {
-            font-size: 6.5px !important;
-            margin: 8px 0 !important;
+        table.rateio-table {
             width: 100%;
             border-collapse: collapse;
-            table-layout: auto;
+            margin-top: 6px;
+            font-family: 'Inter', sans-serif;
+            font-size: 7.5pt;
         }
-        .compact-table th {
-            padding: 2.5px 3px !important;
-            font-size: 6.5px !important;
-            line-height: 1.15;
-            white-space: normal !important;
-            word-break: break-word !important;
-            background-color: #f8fafc;
-            color: #334155;
-            font-weight: 600;
+        table.rateio-table th.th-apelido {
+            text-align: right;
+            border: 1px solid #334155;
+            background: #0f172a;
+            color: #38bdf8; /* Azul Céu */
+            font-weight: 800;
             text-transform: uppercase;
+            font-size: 8.5pt;
+            padding: 4px 6px;
+            white-space: nowrap;
         }
-        .compact-table td {
-            padding: 2.5px 3px !important;
-            font-size: 6.5px !important;
-            white-space: nowrap !important;
-            font-family: monospace;
+        table.rateio-table th.th-cargo {
+            text-align: right;
+            border: 1px solid #475569;
+            background: #1e293b;
+            color: #e2e8f0;
+            font-weight: 600;
+            font-size: 7.5pt;
+            padding: 4px 6px;
+            white-space: nowrap;
         }
-        .obs-box {
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-            padding: 16px;
-            font-size: 10.5px;
-            border-radius: 8px;
-            margin-top: 20px;
-            color: #475569;
-            line-height: 1.5;
+        table.rateio-table th.th-main {
+            border: 1px solid #334155;
+            background: #0f172a;
+            color: #ffffff;
+            font-weight: 700;
+            font-size: 8pt;
+            padding: 4px 6px;
+            white-space: nowrap;
         }
-        @page landscape-page {
-            size: landscape;
-            margin: 1.2cm;
+        table.rateio-table td.td-num {
+            text-align: right;
+            font-family: 'Inter', sans-serif;
+            font-size: 7.5pt;
+            white-space: nowrap;
+            border: 1px solid #cbd5e1;
+            padding: 3px 6px;
+            color: #0f172a;
         }
-        .landscape-section {
-            page-break-before: always;
-            break-before: page;
-            page: landscape-page;
-            width: 100%;
+        table.rateio-table td.td-date {
+            text-align: center;
+            font-family: 'Inter', sans-serif;
+            font-size: 7.5pt;
+            white-space: nowrap;
+            border: 1px solid #cbd5e1;
+            padding: 3px 6px;
+            color: #0f172a;
+        }
+        table.rateio-table tfoot tr {
+            background: #f1f5f9;
+            font-weight: bold;
+            border-top: 2px solid #0f172a;
+            font-size: 7.5pt;
         }
         @media print {
             body { background: white; padding: 0; }
-            .toolbar { display: none; }
-            .contract-wrapper { 
-                margin: 0; 
-                padding: 0; 
-                box-shadow: none; 
-                border: none;
-                max-width: 100%;
+            .toolbar { display: none !important; }
+            .page-sheet { 
+                margin: 0 !important; 
+                padding: 0 !important; 
+                box-shadow: none !important; 
+                border: none !important; 
+                max-width: 100% !important; 
+                width: 100% !important; 
+                min-height: auto !important; 
+            }
+            .page-break {
+                page-break-before: always !important;
+                break-before: page !important;
             }
         }
     </style>
 </head>
 <body>
     <div class="toolbar">
-        <button class="btn btn-print" onclick="window.print()">Imprimir Contrato</button>
+        <button class="btn btn-print" onclick="window.print()">Imprimir / Salvar em PDF</button>
         <button class="btn btn-close" onclick="window.close()">Fechar</button>
     </div>
 
-    <div class="contract-wrapper">
+    <!-- PÁGINA 1: IDENTIFICAÇÃO, OBJETO E EQUIPE -->
+    <div class="page-sheet page-1">
+        <div style="text-align: center; margin-bottom: 8px;" class="avoid-break">
+            <img src="LOGORJ.png" alt="R&J Imóveis" class="contract-logo" onerror="this.onerror=null; this.src='/LOGORJ.png';">
+        </div>
         <div class="title">${contractModel.titulo}</div>
+        <div class="subtitle">CONTRATO DE INTERMEDIAÇÃO E RATEIO DE HONORÁRIOS DE CORRETAGEM IMOBILIÁRIA</div>
 
-        <div class="section-header">I - PARTES</div>
+        <div class="section-header">I - QUALIFICAÇÃO DAS PARTES</div>
         
-        <div class="section-header" style="border:none; font-size:10px; margin-top:10px; color:#475569;">
+        <div style="font-size: 10pt; font-weight: 700; margin-top: 6px; margin-bottom: 4px; color: #0f172a; text-transform: uppercase;">
             1. ${contractModel.preambulo.contratantes.length > 1 ? 'CONTRATANTES (PROPONENTES COMPRADORES)' : 'CONTRATANTE (PROPONENTE COMPRADOR)'}
         </div>
         ${contractModel.preambulo.contratantes.map((c, idx) => `
             ${contractModel.preambulo.contratantes.length > 1 ? `
-                <div style="font-size: 10px; font-weight: 700; color: #1e293b; margin-top: ${idx > 0 ? '12px' : '6px'}; margin-bottom: 6px; padding: 4px 8px; background: #f1f5f9; border-left: 3px solid #0f172a; border-radius: 2px;">
+                <div style="font-size: 9.5pt; font-weight: 700; color: #0f172a; margin-top: ${idx > 0 ? '6px' : '2px'}; margin-bottom: 4px; padding: 2px 6px; background: #f1f5f9; border-left: 3px solid #0f172a; border-radius: 2px;">
                     COMPRADOR ${idx + 1}: ${c.nome_completo}
                 </div>
             ` : ''}
-            <div class="grid-preambulo" style="${contractModel.preambulo.contratantes.length > 1 && idx > 0 ? 'margin-top: 4px;' : ''}">
+            <div class="grid-preambulo" style="${contractModel.preambulo.contratantes.length > 1 && idx > 0 ? 'margin-top: 2px;' : ''}">
                 <div>
                     <div class="grid-col"><span class="label">Nome Completo:</span><span class="value">${c.nome_completo}</span></div>
                     <div class="grid-col"><span class="label">Nacionalidade:</span><span class="value">${c.nacionalidade}</span></div>
@@ -5272,7 +6250,7 @@ export default function App() {
             </div>
         `).join('')}
 
-        <div class="section-header" style="border:none; font-size:10px; margin-top:15px; color:#475569;">2. CONTRATADA (INTERMEDIADORA)</div>
+        <div style="font-size: 10pt; font-weight: 700; margin-top: 6px; margin-bottom: 4px; color: #0f172a; text-transform: uppercase;">2. CONTRATADA (INTERMEDIADORA)</div>
         <div class="grid-preambulo">
             <div>
                 <div class="grid-col"><span class="label">Razão Social:</span><span class="value">${contractModel.preambulo.contratada.razao_social}</span></div>
@@ -5286,25 +6264,26 @@ export default function App() {
             </div>
         </div>
 
-        <div class="section-header">II - IMÓVEL</div>
+        <div class="section-header">II - OBJETO DO IMÓVEL</div>
         <div class="grid-preambulo" style="grid-template-columns: 1fr;">
             <div>
-                <div class="grid-col" style="margin:0;"><span class="label">Objeto da Intermediação:</span><span class="value">${contractModel.preambulo.objeto.identificacao}</span></div>
+                <div class="grid-col" style="margin: 0 0 3px 0;"><span class="label">Objeto da Intermediação:</span><span class="value">${contractModel.preambulo.objeto.identificacao}</span></div>
+                <div class="grid-col" style="margin: 0;"><span class="label">Endereço do Empreendimento:</span><span class="value">${contractModel.preambulo.objeto.endereco}</span></div>
             </div>
         </div>
 
         <div class="section-header">III - EQUIPE DE VENDAS</div>
-        <div style="font-size: 10px; font-weight: 600; color: #475569; margin-top: 10px; margin-bottom: 5px; text-transform: uppercase;">
+        <div style="font-size: 9.5pt; font-weight: 700; color: #0f172a; margin-top: 6px; margin-bottom: 4px; text-transform: uppercase;">
             Credenciais dos Participantes na Venda (Rateio)
         </div>
-        <table style="margin-top:5px; margin-bottom:20px;">
+        <table class="table-dados">
             <thead>
                 <tr>
-                    <th>Nome</th>
-                    <th>Apelido</th>
-                    <th>CPF / CNPJ</th>
-                    <th>CRECI</th>
-                    <th>Cargo na Operação</th>
+                    <th style="width: 16%;">Apelido</th>
+                    <th style="width: 34%;">Nome Completo ou Razão Social</th>
+                    <th style="width: 20%;">CPF / CNPJ</th>
+                    <th style="width: 14%;">CRECI</th>
+                    <th style="width: 16%;">Função / Cargo</th>
                 </tr>
             </thead>
             <tbody>
@@ -5312,8 +6291,8 @@ export default function App() {
                     <tr><td colspan="5" style="text-align: center; font-style: italic; color: #64748b;">Participação concentrada integralmente na Imobiliária Contratada.</td></tr>
                 ` : contractModel.preambulo.corretores_associados.map(c => `
                     <tr>
-                        <td><b>${c.nome_completo}</b></td>
-                        <td>${c.apelido}</td>
+                        <td><b>${c.apelido}</b></td>
+                        <td>${c.nome_completo}</td>
                         <td style="font-family: monospace;">${c.cpf_cnpj}</td>
                         <td style="font-family: monospace;">${c.creci}</td>
                         <td>${c.cargo}</td>
@@ -5321,325 +6300,274 @@ export default function App() {
                 `).join('')}
             </tbody>
         </table>
+    </div>
 
-        <div class="section-header">IV - CLÁUSULAS CONTRATUAIS</div>
-        ${contractModel.clausulas.map(c => `
-            <div style="margin-bottom: 11px; line-height: 1.55;">
+    <!-- PÁGINA 2: CLÁUSULAS CONTRATUAIS (CLÁUSULAS 1 A 8) -->
+    <div class="page-sheet page-break page-2">
+        <div class="section-header" style="margin-top: 0; margin-bottom: 14px;">IV - CLÁUSULAS CONTRATUAIS</div>
+        ${contractModel.clausulas.slice(0, 8).map(c => `
+            <div class="clausula-item">
                 <div class="text-justify" style="margin-bottom: ${c.subitens ? '6px' : '0'};">
                     <strong style="color: #0f172a;">${c.numero}.</strong> ${c.texto}
                 </div>
                 ${c.subitens ? `
                     <div style="padding-left: 20px; margin-top: 5px;">
                         ${c.subitens.map(sub => `
-                            <div class="text-justify" style="margin-bottom: 4px; line-height: 1.5;">${sub}</div>
+                            <div class="alinea-item">${sub}</div>
+                        `).join('')}
+                    </div>
+                ` : ''}
+            </div>
+        `).join('')}
+    </div>
+
+    <!-- PÁGINA 3: CONTINUAÇÃO DE CLÁUSULAS E ASSINATURAS -->
+    <div class="page-sheet page-break page-3">
+        <div class="section-header" style="margin-top: 0; margin-bottom: 14px;">IV - CLÁUSULAS CONTRATUAIS (CONTINUAÇÃO)</div>
+        ${contractModel.clausulas.slice(8).map(c => `
+            <div class="clausula-item">
+                <div class="text-justify" style="margin-bottom: ${c.subitens ? '6px' : '0'};">
+                    <strong style="color: #0f172a;">${c.numero}.</strong> ${c.texto}
+                </div>
+                ${c.subitens ? `
+                    <div style="padding-left: 20px; margin-top: 5px;">
+                        ${c.subitens.map(sub => `
+                            <div class="alinea-item">${sub}</div>
                         `).join('')}
                     </div>
                 ` : ''}
             </div>
         `).join('')}
 
-        <div class="signatures-section">
-            <div style="font-style: italic; margin-bottom: 25px; color: #475569;">E, por estarem as partes justas e contratadas, assinam o presente contrato.</div>
-            
-            <div style="font-weight: 600; margin-bottom: 5px; font-size: 10px; text-transform: uppercase; color: #475569;">Local e Data:</div>
-            <div style="font-size: 11px; margin-bottom: 20px;">${contractModel.assinaturas.data_local}</div>
+        <div class="section-header">V - DOS VALORES, RATEIO E COMISSÕES (PLANILHA ANEXA)</div>
+        <div style="margin-bottom: 15px; font-size: 12pt; line-height: 1.5; text-align: justify; color: #334155;">
+            Os valores da intermediação imobiliária, retenções contratuais, cronograma de desembolso e amortização da comissão devida aos participantes da venda qualificados no Item III encontram-se integralmente descritos e discriminados nos <strong>Anexos I e II</strong>, que integram o presente contrato para todos os efeitos de direito.
+        </div>
 
+        <div class="section-header">VI - DAS ASSINATURAS</div>
+        <div class="signatures-section avoid-break">
+            <div style="text-align: justify; font-size: 11pt; color: #0f172a; margin-bottom: 8px;">
+                ${isNFRepasse ? 'E, por estarem as partes justas e contratadas, assinam o presente Contrato de Corretagem Imobiliária eletronicamente na presença de 2 (duas) testemunhas.' : 'E, por estarem as partes justas e contratadas, assinam o presente contrato.'}
+            </div>
+            
+            <div style="text-align: center; margin: 10px 0 14px 0; font-weight: 700; font-size: 10.5pt; color: #0f172a; text-transform: uppercase;">
+                ${contractModel.assinaturas.data_local}
+            </div>
+
+            <div style="font-size: 9.5pt; font-weight: 700; text-transform: uppercase; color: #334155; margin-bottom: 4px;">Contratantes e Imobiliária Contratada:</div>
             <div class="signatures-grid">
                 ${contractModel.preambulo.contratantes.map((c, idx) => `
                     <div class="signature-box">
-                        <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${c.nome_completo}</div>
+                        <div style="font-weight: 700; margin-bottom: 2px; color: #0f172a; font-size: 10pt;">${c.nome_completo}</div>
                         <div class="signature-title">${contractModel.preambulo.contratantes.length > 1 ? `CONTRATANTE / COMPRADOR ${idx + 1}` : 'CONTRATANTE / PROPONENTE COMPRADOR'}</div>
-                        <div style="font-size: 9px; color: #64748b; margin-top: 2px;">CPF: ${c.cpf}</div>
+                        <div style="font-size: 9pt; color: #475569; margin-top: 2px;">CPF: ${c.cpf}</div>
                     </div>
                 `).join('')}
                 <div class="signature-box">
-                    <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${contractModel.assinaturas.contratada}</div>
+                    <div style="font-weight: 700; margin-bottom: 2px; color: #0f172a; font-size: 10pt;">${contractModel.assinaturas.contratada}</div>
                     <div class="signature-title">CONTRATADA / IMOBILIÁRIA</div>
-                    <div style="font-size: 9px; color: #64748b; margin-top: 2px;">CNPJ: ${contractModel.preambulo.contratada.cnpj} - CRECI: ${contractModel.preambulo.contratada.creci}</div>
+                    <div style="font-size: 9pt; color: #475569; margin-top: 2px;">CNPJ: ${contractModel.preambulo.contratada.cnpj} - CRECI: ${contractModel.preambulo.contratada.creci}</div>
                 </div>
                 ${(contractModel.preambulo.contratantes.length + 1) % 2 !== 0 ? `
-                    <div class="signature-box" style="border: none; margin-top: 30px;"></div>
+                    <div class="signature-box" style="border: none; margin-top: 15px;"></div>
                 ` : ''}
             </div>
 
             ${contractModel.preambulo.corretores_associados.length > 0 ? `
+            <div style="font-size: 9.5pt; font-weight: 700; text-transform: uppercase; color: #334155; margin-top: 16px; margin-bottom: 4px;">Participantes da Venda / Equipe de Vendas (Item III):</div>
             <div class="signatures-grid">
                 ${contractModel.preambulo.corretores_associados.map(c => `
                     <div class="signature-box">
-                        <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${c.nome_completo}</div>
+                        <div style="font-weight: 700; margin-bottom: 2px; color: #0f172a; font-size: 10pt;">${c.nome_completo}</div>
                         <div class="signature-title">${c.cargo}</div>
+                        <div style="font-size: 9pt; color: #475569; margin-top: 2px;">CPF/CNPJ: ${c.cpf_cnpj}${c.creci && !c.creci.includes('____') ? ` - CRECI: ${c.creci}` : ''}</div>
                     </div>
                 `).join('')}
                 ${contractModel.preambulo.corretores_associados.length % 2 !== 0 ? `
-                    <div class="signature-box" style="border: none; margin-top: 30px;"></div>
+                    <div class="signature-box" style="border: none; margin-top: 15px;"></div>
                 ` : ''}
             </div>
             ` : ''}
 
-            <div class="signatures-grid" style="margin-top: 40px;">
+            <div style="font-size: 9.5pt; font-weight: 700; text-transform: uppercase; color: #334155; margin-top: 16px; margin-bottom: 4px;">Testemunhas Instrumentárias:</div>
+            <div class="signatures-grid" style="margin-top: 6px;">
                 ${contractModel.assinaturas.testemunhas.map(t => `
-                    <div class="signature-box" style="border-top: 1px solid #cbd5e1; margin-top: 0;">
-                        <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">Testemunha ${t.numero}</div>
-                        <div style="font-size: 9px; color: #64748b;">CPF: ${t.cpf}</div>
+                    <div class="signature-box" style="border-top: 1px solid #0f172a; margin-top: 0;">
+                        <div style="font-weight: 700; margin-bottom: 2px; color: #0f172a; font-size: 10pt;">Testemunha ${t.numero}</div>
+                        <div class="signature-title">TESTEMUNHA INSTRUMENTÁRIA</div>
+                        <div style="font-size: 9pt; color: #475569;">CPF: ${t.cpf}</div>
                     </div>
                 `).join('')}
             </div>
         </div>
+    </div>
 
-        <!-- ANEXO I -->
-        <div class="anexo-wrapper">
-            <div class="anexo-title">ANEXO I - ${contractModel.anexo_i.titulo}</div>
-            
-            <div style="margin-bottom: 20px; background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px solid #e2e8f0;">
-                <div style="margin-bottom: 8px;"><strong style="text-transform: uppercase; font-size: 9px; color: #475569; letter-spacing: 0.3px;">Dados do Cliente:</strong> <span style="font-size: 11px; color: #0f172a;">${contractModel.anexo_i.dados_do_cliente.nome} — CPF: ${contractModel.anexo_i.dados_do_cliente.cpf}</span></div>
-                <div><strong style="text-transform: uppercase; font-size: 9px; color: #475569; letter-spacing: 0.3px;">Dados do Objeto:</strong> <span style="font-size: 11px; color: #0f172a;">${contractModel.anexo_i.dados_do_objeto.identificacao}</span></div>
+    <!-- PÁGINA 4: ANEXOS I E II -->
+    <div class="page-sheet page-break page-4">
+        <div class="anexo-title" style="margin-top: 0;">ANEXO I - RESUMO DA PROPOSTA E COMISSÕES</div>
+        
+        <div style="margin-bottom: 10px; background: #f8fafc; padding: 10px 14px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 9.5pt; line-height: 1.4;">
+            <div style="margin-bottom: 4px;"><strong style="text-transform: uppercase; font-size: 9pt; font-weight: 700; color: #334155; letter-spacing: 0.3px;">Dados do Cliente:</strong> <span style="color: #0f172a;">${contractModel.anexo_i.dados_do_cliente.nome} — CPF: ${contractModel.anexo_i.dados_do_cliente.cpf}</span></div>
+            <div style="margin-bottom: 4px;"><strong style="text-transform: uppercase; font-size: 9pt; font-weight: 700; color: #334155; letter-spacing: 0.3px;">Dados do Objeto:</strong> <span style="color: #0f172a;">${contractModel.anexo_i.dados_do_objeto.identificacao}</span></div>
+            <div><strong style="text-transform: uppercase; font-size: 9pt; font-weight: 700; color: #334155; letter-spacing: 0.3px;">Endereço do Empreendimento:</strong> <span style="color: #0f172a;">${contractModel.preambulo.objeto.endereco}</span></div>
+        </div>
+
+        <!-- Resumo de Valores -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 14px;">
+            <div style="background: #f8fafc; border: 1px solid #e2e8f0; padding: 10px 12px; border-radius: 6px;">
+                <div style="font-size: 9pt; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Valor Total da Proposta</div>
+                <div style="font-size: 12pt; font-weight: 700; color: #0f172a;">${formattedTotalProposta}</div>
             </div>
-
-            <!-- Resumo de Valores -->
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-top: 25px; margin-bottom: 25px;">
-                <div style="background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px 16px; border-radius: 8px;">
-                    <div style="font-size: 9px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Valor Total da Proposta</div>
-                    <div style="font-size: 15px; font-weight: 700; color: #0f172a;">${formattedTotalProposta}</div>
-                </div>
-                <div style="background: #fffbeb; border: 1px solid #fde68a; padding: 12px 16px; border-radius: 8px;">
-                    <div style="font-size: 9px; font-weight: 700; color: #b45309; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Valor Total das Comissões</div>
-                    <div style="font-size: 15px; font-weight: 700; color: #b45309;">${formattedTotalComissoes}</div>
-                </div>
-                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; padding: 12px 16px; border-radius: 8px;">
-                    <div style="font-size: 9px; font-weight: 700; color: #166534; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Valor Total do Imóvel</div>
-                    <div style="font-size: 15px; font-weight: 700; color: #166534;">${formattedTotalImovel}</div>
-                    <div style="font-size: 8px; color: #15803d; margin-top: 2px;">(Proposta - Comissões)</div>
-                </div>
+            <div style="background: #fffbeb; border: 1px solid #fde68a; padding: 10px 12px; border-radius: 6px;">
+                <div style="font-size: 9pt; font-weight: 700; color: #b45309; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Valor Total das Comissões</div>
+                <div style="font-size: 12pt; font-weight: 700; color: #b45309;">${formattedTotalComissoes}</div>
             </div>
-
-            <div class="clausula-title" style="margin-top: 25px; font-size: 11px; font-weight: 700;">1. CONDIÇÃO DE PAGAMENTO DA PROPOSTA</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 50px; text-align: center;">QTD</th>
-                        <th>TIPO</th>
-                        <th style="text-align: right;">VALOR DA PARCELA</th>
-                        <th style="width: 100px; text-align: center;">VENCIMENTO</th>
-                        <th style="width: 100px; text-align: center;">VENCIMENTO FINAL</th>
-                        <th style="text-align: right;">VALOR TOTAL DA PARCELA</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${condicaoPagamentoPropostaRows}
-                </tbody>
-                <tfoot>
-                    <tr style="background: #f8fafc; font-weight: bold;">
-                        <td colspan="5" style="text-align: right;">TOTAL GERAL:</td>
-                        <td style="text-align: right;">${formatCurrency(totalPropostaGeral)}</td>
-                    </tr>
-                </tfoot>
-            </table>
-
-            <div class="clausula-title" style="margin-top: 25px; font-size: 11px; font-weight: 700;">2. CONDIÇÃO DE PAGAMENTO DO PREÇO</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 50px; text-align: center;">QTD</th>
-                        <th>TIPO</th>
-                        <th style="text-align: right;">VALOR DA PARCELA</th>
-                        <th style="width: 100px; text-align: center;">VENCIMENTO</th>
-                        <th style="width: 100px; text-align: center;">VENCIMENTO FINAL</th>
-                        <th style="text-align: right;">VALOR TOTAL DA PARCELA</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${condicaoPagamentoPrecoRows}
-                </tbody>
-                <tfoot>
-                    <tr style="background: #f8fafc; font-weight: bold;">
-                        <td colspan="5" style="text-align: right;">TOTAL GERAL:</td>
-                        <td style="text-align: right;">${formatCurrency(totalPrecoGeral)}</td>
-                    </tr>
-                </tfoot>
-            </table>
-
-            <div class="clausula-title" style="margin-top: 25px; font-size: 11px; font-weight: 700;">3. CONDIÇÃO DE PAGAMENTO DAS COMISSÕES</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 50px; text-align: center;">QTD</th>
-                        <th>TIPO</th>
-                        <th style="text-align: right;">VALOR DA PARCELA</th>
-                        <th style="width: 100px; text-align: center;">VENCIMENTO</th>
-                        <th style="width: 100px; text-align: center;">VENCIMENTO FINAL</th>
-                        <th style="text-align: right;">VALOR TOTAL DA PARCELA</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${condicaoPagamentoComissaoRows}
-                </tbody>
-                <tfoot>
-                    <tr style="background: #f8fafc; font-weight: bold;">
-                        <td colspan="5" style="text-align: right;">TOTAL GERAL:</td>
-                        <td style="text-align: right;">${formatCurrency(totalComissaoGeral)}</td>
-                    </tr>
-                </tfoot>
-            </table>
-
-            <div class="obs-box">
-                <strong style="text-transform: uppercase; font-size: 9.5px; color: #0f172a; letter-spacing: 0.3px;">Observações:</strong> ${contractModel.anexo_i.observacao}
-            </div>
-
-            <div class="signatures-grid" style="margin-top: 50px; page-break-inside: avoid;">
-                ${contractModel.preambulo.contratantes.map((c, idx) => `
-                    <div class="signature-box">
-                        <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${c.nome_completo}</div>
-                        <div class="signature-title">${contractModel.preambulo.contratantes.length > 1 ? `CONTRATANTE / COMPRADOR ${idx + 1}` : 'CONTRATANTE / PROPONENTE COMPRADOR'}</div>
-                    </div>
-                `).join('')}
-                <div class="signature-box">
-                    <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${contractModel.assinaturas.contratada}</div>
-                    <div class="signature-title">CONTRATADA / IMOBILIÁRIA</div>
-                </div>
-                ${(contractModel.preambulo.contratantes.length + 1) % 2 !== 0 ? `
-                    <div class="signature-box" style="border: none; margin-top: 30px;"></div>
-                ` : ''}
+            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; padding: 10px 12px; border-radius: 6px;">
+                <div style="font-size: 9pt; font-weight: 700; color: #166534; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Valor Total do Imóvel</div>
+                <div style="font-size: 12pt; font-weight: 700; color: #166534;">${formattedTotalImovel}</div>
+                <div style="font-size: 8pt; color: #15803d; margin-top: 2px;">(Proposta - Comissões)</div>
             </div>
         </div>
 
         <!-- ANEXO II -->
-        <div class="anexo-wrapper" style="margin-top: 30px; padding-top: 30px;">
-            <div class="anexo-title" style="margin-bottom: 15px;">ANEXO II - TABELA DE RATEIO</div>
-            
-            <div style="margin-bottom: 12px; background: #f8fafc; padding: 10px 12px; border-radius: 8px; border: 1px solid #e2e8f0;">
-                <div style="margin-bottom: 6px;"><strong style="text-transform: uppercase; font-size: 9px; color: #475569; letter-spacing: 0.3px;">Dados do Cliente:</strong> <span style="font-size: 11px; color: #0f172a;">${contractModel.anexo_i.dados_do_cliente.nome} — CPF: ${contractModel.anexo_i.dados_do_cliente.cpf}</span></div>
-                <div><strong style="text-transform: uppercase; font-size: 9px; color: #475569; letter-spacing: 0.3px;">Dados do Objeto:</strong> <span style="font-size: 11px; color: #0f172a;">${contractModel.anexo_i.dados_do_objeto.identificacao}</span></div>
-            </div>
-
-            <!-- Resumo das comissões por participante -->
-            <div class="clausula-title" style="margin-top: 15px; font-size: 11px; font-weight: 700;">RESUMO DE COMISSÃO POR PROFISSIONAL / CARGO</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>PROFISSIONAL / CARGO</th>
-                        <th style="text-align: right;">COMISSÃO RECEBIDA</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${contractWaterfall.participantes.map(p => {
-                      const label = p.name ? `${p.role} - ${p.name}` : p.role;
-                      return `
-                        <tr>
-                          <td><strong>${label}</strong></td>
-                          <td style="text-align: right; font-family: monospace; color: #166534; font-weight: bold;">${formatCurrency(p.received)}</td>
-                        </tr>
-                      `;
-                    }).join('')}
-                </tbody>
-            </table>
-
-            <div class="signatures-grid" style="margin-top: 30px; page-break-inside: avoid;">
-                ${contractModel.preambulo.contratantes.map((c, idx) => `
-                    <div class="signature-box">
-                        <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${c.nome_completo}</div>
-                        <div class="signature-title">${contractModel.preambulo.contratantes.length > 1 ? `CONTRATANTE / COMPRADOR ${idx + 1}` : 'CONTRATANTE / PROPONENTE COMPRADOR'}</div>
-                    </div>
-                `).join('')}
-                <div class="signature-box">
-                    <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${contractModel.assinaturas.contratada}</div>
-                    <div class="signature-title">CONTRATADA / IMOBILIÁRIA</div>
-                </div>
-                ${(contractModel.preambulo.contratantes.length + 1) % 2 !== 0 ? `
-                    <div class="signature-box" style="border: none; margin-top: 30px;"></div>
-                ` : ''}
-            </div>
+        <div class="anexo-title" style="margin-top: 14px; margin-bottom: 8px;">ANEXO II - DETALHAMENTO DE RATEIO CRONOLÓGICO REAL</div>
+        
+        <div style="margin-bottom: 10px; background: #f8fafc; padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; font-size: 9.5pt;">
+            <div><strong style="text-transform: uppercase; font-size: 8pt; font-weight: 700; color: #475569; letter-spacing: 0.3px; display: block;">Empreendimento</strong> <span style="font-weight: 700; color: #0f172a;">${property.empreendimento || "-"}</span></div>
+            <div><strong style="text-transform: uppercase; font-size: 8pt; font-weight: 700; color: #475569; letter-spacing: 0.3px; display: block;">Unidade / Torre</strong> <span style="font-weight: 700; color: #0f172a;">${property.unidade || "-"} / ${property.torre || "-"}</span></div>
+            <div><strong style="text-transform: uppercase; font-size: 8pt; font-weight: 700; color: #475569; letter-spacing: 0.3px; display: block;">Comissão Global</strong> <span style="font-weight: 700; color: #0f172a;">${(data as any).percentualComissao !== undefined ? (data as any).percentualComissao : percentualComissao}% (${formatCurrency(contractWaterfall.comissaoTotal)})</span></div>
         </div>
 
-        <!-- Tabela 2 na próxima página no formato paisagem (Anexo III) -->
-        <div class="landscape-section" style="padding-top: 20px;">
-            <div class="anexo-title" style="margin-bottom: 15px;">ANEXO III - DETALHAMENTO DE RATEIO CRONOLÓGICO REAL</div>
-            
-            <div style="margin-bottom: 12px; background: #f8fafc; padding: 10px 12px; border-radius: 8px; border: 1px solid #e2e8f0;">
-                <div style="margin-bottom: 6px;"><strong style="text-transform: uppercase; font-size: 9px; color: #475569; letter-spacing: 0.3px;">Dados do Cliente:</strong> <span style="font-size: 11px; color: #0f172a;">${contractModel.anexo_i.dados_do_cliente.nome} — CPF: ${contractModel.anexo_i.dados_do_cliente.cpf}</span></div>
-                <div><strong style="text-transform: uppercase; font-size: 9px; color: #475569; letter-spacing: 0.3px;">Dados do Objeto:</strong> <span style="font-size: 11px; color: #0f172a;">${contractModel.anexo_i.dados_do_objeto.identificacao}</span></div>
-            </div>
+        ${(() => {
+          let runningSum = 0;
+          const visibleParcelas = [];
+          for (let idx = 0; idx < contractWaterfall!.detalhesParcelas.length; idx++) {
+            const det = contractWaterfall!.detalhesParcelas[idx];
+            const correspondingSimFluxo = (sim && idx < sim.fluxo.length && contractWaterfall!.detalhesParcelas.length > 1)
+              ? sim.fluxo[idx]
+              : null;
 
-            <table class="compact-table">
+            const vencimentoToShow = det.vencimento || (correspondingSimFluxo ? correspondingSimFluxo.vencimento : '');
+            const valorComissaoToShow = (det.valorRetido > 0 || (data as any).manual_waterfall)
+              ? det.valorRetido
+              : (correspondingSimFluxo ? Number((correspondingSimFluxo.valorTotal - correspondingSimFluxo.valorLiquido).toFixed(2)) : det.valorRetido);
+
+            if (valorComissaoToShow > 0) {
+              visibleParcelas.push({
+                ...det,
+                vencimentoToShow,
+                valorComissaoToShow
+              });
+            }
+            runningSum = Number((runningSum + valorComissaoToShow).toFixed(2));
+            if (runningSum >= contractWaterfall!.comissaoTotal - 0.01 && contractWaterfall!.comissaoTotal > 0) {
+              break;
+            }
+          }
+
+          const totalComissaoLinhas = visibleParcelas.reduce((acc, d) => acc + d.valorComissaoToShow, 0);
+
+          return `
+            <table class="rateio-table">
                 <thead>
                     <tr>
-                        <th style="text-align: left; vertical-align: top; white-space: nowrap;">VENCIMENTO</th>
-                        <th style="text-align: right; vertical-align: top; color: #4f46e5; white-space: nowrap;">COMISSÃO PARCELA</th>
-                        ${contractWaterfall.participantes.map(p => {
-                          const label = p.name ? `${p.role} - ${p.name}` : p.role;
-                          return `<th style="text-align: right; vertical-align: top; max-width: 110px;">${label}</th>`;
+                        <th style="border: 1px solid #334155; background: #0f172a;" colspan="2"></th>
+                        ${contractWaterfall!.participantes.map(p => {
+                          const apelido = getParticipantApelido(p.name, corretores) || (p.role?.toLowerCase().includes('imobili') ? 'R&J' : (p.name ? p.name.split(' ')[0] : ''));
+                          return `
+                            <th class="th-apelido">
+                              ${apelido || p.role}
+                            </th>
+                          `;
                         }).join('')}
+                    </tr>
+                    <tr>
+                        <th class="th-main" style="text-align: right;">
+                            VALOR
+                        </th>
+                        <th class="th-main" style="text-align: center;">
+                            VENCIMENTO
+                        </th>
+                        ${contractWaterfall!.participantes.map(p => `
+                          <th class="th-cargo">
+                            ${p.role}
+                          </th>
+                        `).join('')}
                     </tr>
                 </thead>
                 <tbody>
-                    ${(() => {
-                      let runningSum = 0;
-                      const visibleParcelas = [];
-                      for (let idx = 0; idx < contractWaterfall!.detalhesParcelas.length; idx++) {
-                        const det = contractWaterfall!.detalhesParcelas[idx];
-                        const correspondingSimFluxo = (sim && idx < sim.fluxo.length && contractWaterfall!.detalhesParcelas.length > 1)
-                          ? sim.fluxo[idx]
-                          : null;
-
-                        const vencimentoToShow = correspondingSimFluxo ? correspondingSimFluxo.vencimento : det.vencimento;
-                        const valorComissaoToShow = correspondingSimFluxo 
-                          ? Number((correspondingSimFluxo.valorTotal - correspondingSimFluxo.valorLiquido).toFixed(2)) 
-                          : det.valorRetido;
-
-                        if (valorComissaoToShow > 0) {
-                          visibleParcelas.push({
-                            ...det,
-                            vencimentoToShow,
-                            valorComissaoToShow
-                          });
-                        }
-                        runningSum = Number((runningSum + valorComissaoToShow).toFixed(2));
-                        if (runningSum >= contractWaterfall!.comissaoTotal - 0.01 && contractWaterfall!.comissaoTotal > 0) {
-                          break;
-                        }
-                      }
-
-                      return visibleParcelas.map((det) => {
-                        return `
-                          <tr>
-                            <td style="font-family: monospace; white-space: nowrap;">${det.vencimentoToShow}</td>
-                            <td style="text-align: right; font-family: monospace; color: #4f46e5; font-weight: bold; white-space: nowrap;">
-                              ${formatCurrency(det.valorComissaoToShow)}
+                    ${visibleParcelas.map((det) => `
+                      <tr>
+                        <td class="td-num" style="font-weight: 700;">
+                          ${formatCurrency(det.valorComissaoToShow)}
+                        </td>
+                        <td class="td-date">
+                          ${det.vencimentoToShow}
+                        </td>
+                        ${contractWaterfall!.participantes.map(p => {
+                          const label = p.name ? `${p.role} - ${p.name}` : p.role;
+                          const val = det.distribuicao[label] || 0;
+                          return `
+                            <td class="td-num">
+                              ${formatCurrency(val)}
                             </td>
-                            ${contractWaterfall!.participantes.map(p => {
-                              const label = p.name ? `${p.role} - ${p.name}` : p.role;
-                              const val = det.distribuicao[label] || 0;
-                              return `
-                                <td style="text-align: right; font-family: monospace; white-space: nowrap;">
-                                  ${val > 0 ? formatCurrency(val) : '-'}
-                                </td>
-                              `;
-                            }).join('')}
-                          </tr>
-                        `;
-                      }).join('');
-                    })()}
+                          `;
+                        }).join('')}
+                      </tr>
+                    `).join('')}
+                </tbody>
+                <tfoot>
+                    <tr>
+                        <td class="td-num" style="font-weight: 700; color: #0f172a;">
+                          ${formatCurrency(totalComissaoLinhas)}
+                        </td>
+                        <td class="td-date" style="font-weight: 700; color: #0f172a;">
+                          TOTAL
+                        </td>
+                        ${contractWaterfall!.participantes.map(p => {
+                          const label = p.name ? `${p.role} - ${p.name}` : p.role;
+                          const totalCol = visibleParcelas.reduce((sum, det) => sum + (det.distribuicao[label] || 0), 0);
+                          return `
+                            <td class="td-num" style="color: #166534; font-weight: 700;">
+                              ${formatCurrency(totalCol)}
+                            </td>
+                          `;
+                        }).join('')}
+                    </tr>
+                </tfoot>
+            </table>
+          `;
+        })()}
+
+        <!-- Credenciais dos Participantes na Venda (Rateio) -->
+        <div class="avoid-break" style="margin-top: 12px;">
+            <div style="font-size: 9pt; font-weight: 700; text-transform: uppercase; color: #334155; margin-bottom: 4px; letter-spacing: 0.3px; font-family: 'Inter', sans-serif;">
+                Credenciais dos Participantes na Venda (Rateio)
+            </div>
+            <table class="table-dados" style="font-size: 8.5pt;">
+                <thead>
+                    <tr>
+                        <th style="text-align: left; width: 16%;">Apelido</th>
+                        <th style="text-align: left; width: 34%;">Nome Completo ou Razão Social</th>
+                        <th style="text-align: left; width: 20%;">CPF / CNPJ</th>
+                        <th style="text-align: left; width: 14%;">CRECI</th>
+                        <th style="text-align: left; width: 16%;">Cargo na Operação</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${corretores.length === 0 
+                      ? `<tr><td colspan="5" style="text-align: center; color: #94a3b8; font-style: italic; font-size: 8.5pt;">Nenhum participante associado a esta venda.</td></tr>`
+                      : corretores.map(part => `
+                        <tr>
+                            <td style="font-size: 8.5pt;"><strong>${part.apelido}</strong></td>
+                            <td style="font-size: 8.5pt;">${part.nome_completo}</td>
+                            <td style="font-family: monospace; font-size: 8.5pt;">${part.cpf_cnpj}</td>
+                            <td style="font-family: monospace; font-size: 8.5pt;">${part.creci}</td>
+                            <td style="font-size: 8.5pt;"><span style="background: #eef2ff; color: #4338ca; padding: 1px 5px; border-radius: 3px; font-weight: 600; font-size: 8pt;">${part.cargo}</span></td>
+                        </tr>
+                      `).join('')}
                 </tbody>
             </table>
-
-            <div class="obs-box" style="margin-top: 15px; padding: 10px 12px;">
-                <strong style="text-transform: uppercase; font-size: 9.5px; color: #0f172a; letter-spacing: 0.3px;">Nota Legal:</strong> Este Anexo III formaliza o detalhamento de fluxo de caixa e limites de teto de recebimento para cada participante associado.
-            </div>
-
-            <div class="signatures-grid" style="margin-top: 30px; page-break-inside: avoid;">
-                ${contractModel.preambulo.contratantes.map((c, idx) => `
-                    <div class="signature-box">
-                        <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${c.nome_completo}</div>
-                        <div class="signature-title">${contractModel.preambulo.contratantes.length > 1 ? `CONTRATANTE / COMPRADOR ${idx + 1}` : 'CONTRATANTE / PROPONENTE COMPRADOR'}</div>
-                    </div>
-                `).join('')}
-                <div class="signature-box">
-                    <div style="font-weight: 600; margin-bottom: 3px; color: #0f172a;">${contractModel.assinaturas.contratada}</div>
-                    <div class="signature-title">CONTRATADA / IMOBILIÁRIA</div>
-                </div>
-                ${(contractModel.preambulo.contratantes.length + 1) % 2 !== 0 ? `
-                    <div class="signature-box" style="border: none; margin-top: 30px;"></div>
-                ` : ''}
-            </div>
         </div>
     </div>
 </body>
@@ -5959,6 +6887,48 @@ export default function App() {
     document.body.removeChild(link);
   };
 
+  const exportRateioToWebropay = async (waterfall: WaterfallResult | null) => {
+    if (!result) {
+      alert("Nenhuma proposta carregada para exportação.");
+      return;
+    }
+
+    let targetWaterfall = waterfall;
+    if (!targetWaterfall) {
+      const sumExcluded = (result.payments || [])
+        .filter(p => isExcludedFromCommissionBase(p.tipo))
+        .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const sumAllParcelas = (result.payments || []).reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+      const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : (result.valorTotalProposta || 0)) - sumExcluded);
+      const currentEmp = empreendimentos.find(e => e.nome === result.property.empreendimento);
+
+      targetWaterfall = calcularRateioCascata(
+        baseVendaTotal,
+        percentualComissao,
+        (simulationResult?.fluxo || result.payments),
+        result.forma_pagamento_comissao,
+        commissionedParties,
+        currentEmp?.regras_comissao
+      );
+    }
+
+    try {
+      setIsExportingWebropay(true);
+      await generateWebropayExcel({
+        proposal: result,
+        waterfall: targetWaterfall,
+        cargos,
+        simulacaoFluxo: simulationResult?.fluxo,
+      });
+      showToast("Planilha Webropay (.xlsx) gerada com sucesso!", "success");
+    } catch (err: any) {
+      console.error("Erro ao gerar planilha Webropay:", err);
+      alert("Erro ao gerar planilha Webropay: " + (err.message || err));
+    } finally {
+      setIsExportingWebropay(false);
+    }
+  };
+
   const printRateio = (waterfall: WaterfallResult | null) => {
     if (!waterfall || !result) return;
 
@@ -6068,25 +7038,39 @@ export default function App() {
     const printThTdFontSize = totalPrintCols > 7 ? '6.5px' : totalPrintCols > 5 ? '7px' : '8px';
     const printThTdPadding = totalPrintCols > 7 ? '2.5px 3px' : totalPrintCols > 5 ? '3px 4px' : '4px 6px';
 
+    const totalComissaoLinhas = visibleParcelas.reduce((acc, d) => acc + d.valorComissaoToShow, 0);
+
     const headers = `
       <tr>
-        <th style="text-align: left; white-space: nowrap;">Vencimento</th>
-        <th class="text-right" style="white-space: nowrap;">Comissão Parcela</th>
+        <th style="border: 1px solid black; background: #f8fafc;" colspan="2"></th>
+        ${activeParticipants.map(p => `
+          <th class="text-right" style="border: 1px solid black; background: #f0f0f0; font-weight: bold; text-transform: uppercase;">
+            ${p.role}
+          </th>
+        `).join('')}
+      </tr>
+      <tr>
+        <th class="text-right" style="border: 1px solid black; background: #e2e8f0; font-weight: bold; white-space: nowrap;">VALOR</th>
+        <th style="text-align: center; border: 1px solid black; background: #e2e8f0; font-weight: bold; white-space: nowrap;">VENCIMENTO</th>
         ${activeParticipants.map(p => {
-          const label = p.name ? `${p.role} - ${p.name}` : p.role;
-          return `<th class="text-right" style="max-width: 120px; white-space: normal; word-break: break-word;">${label}</th>`;
+          const apelido = getParticipantApelido(p.name) || (p.role?.toLowerCase().includes('imobili') ? 'R&J' : (p.name ? p.name.split(' ')[0] : ''));
+          return `
+            <th class="text-right" style="border: 1px solid black; background: #e2e8f0; font-weight: bold; white-space: nowrap;">
+              ${apelido || p.role}
+            </th>
+          `;
         }).join('')}
       </tr>
     `;
 
     const rows = visibleParcelas.map((det, idx) => `
       <tr>
-        <td style="white-space: nowrap;">${det.vencimentoToShow}</td>
-        <td class="text-right font-bold" style="color: #4f46e5; white-space: nowrap;">${formatCurrency(det.valorComissaoToShow)}</td>
+        <td class="text-right font-bold" style="color: #0f172a; white-space: nowrap;">${formatCurrency(det.valorComissaoToShow)}</td>
+        <td style="text-align: center; white-space: nowrap;">${det.vencimentoToShow}</td>
         ${activeParticipants.map(p => {
           const label = p.name ? `${p.role} - ${p.name}` : p.role;
           const val = det.distribuicao[label] || 0;
-          return `<td class="text-right" style="white-space: nowrap;">${val > 0 ? formatCurrency(val) : '-'}</td>`;
+          return `<td class="text-right" style="white-space: nowrap;">${formatCurrency(val)}</td>`;
         }).join('')}
       </tr>
     `).join('');
@@ -6165,6 +7149,17 @@ export default function App() {
         <tbody>
             ${rows}
         </tbody>
+        <tfoot>
+            <tr style="background: #f0f0f0; font-weight: bold; border-top: 2px solid black;">
+                <td class="text-right font-bold" style="white-space: nowrap;">${formatCurrency(totalComissaoLinhas)}</td>
+                <td style="text-align: center; font-bold; white-space: nowrap;">TOTAL</td>
+                ${activeParticipants.map(p => {
+                  const label = p.name ? `${p.role} - ${p.name}` : p.role;
+                  const totalCol = visibleParcelas.reduce((sum, det) => sum + (det.distribuicao[label] || 0), 0);
+                  return `<td class="text-right font-bold" style="white-space: nowrap;">${formatCurrency(totalCol)}</td>`;
+                }).join('')}
+            </tr>
+        </tfoot>
     </table>
 
     <div style="margin-top: 25px; border-top: 1px solid black; padding-top: 10px;">
@@ -6206,6 +7201,640 @@ export default function App() {
     }
   };
 
+  const printRelatorioEspecialista = () => {
+    if (!result || !waterfallResult) return;
+    const diag = gerarDiagnosticoEspecialista(waterfallResult);
+    const formatCurrency = (val: number) => Number(val || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+
+    const html = `
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Laudo Técnico de Auditoria e Rateio de Comissões - ${result.property.empreendimento || "Imóvel"}</title>
+    <style>
+        @page { size: A4 landscape; margin: 10mm; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; font-size: 8px; margin: 0; padding: 15px; color: #0f172a; background: white; line-height: 1.3; }
+        .header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px; border-bottom: 2px solid black; padding-bottom: 8px; }
+        .title { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }
+        .subtitle { font-size: 9px; color: #475569; margin-top: 2px; }
+        .meta-box { text-align: right; font-size: 8px; font-family: monospace; }
+        .badge-status { display: inline-block; padding: 3px 6px; font-weight: bold; font-size: 8.5px; border-radius: 3px; }
+        .badge-success { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+        .badge-warning { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+        .section-title { font-size: 9.5px; font-weight: 800; text-transform: uppercase; margin-top: 14px; margin-bottom: 5px; padding-bottom: 3px; border-bottom: 1px solid black; letter-spacing: 0.4px; }
+        .params-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 10px; border: 1px solid #cbd5e1; padding: 6px; background: #f8fafc; }
+        .param-item { display: flex; flex-direction: column; }
+        .param-label { font-size: 7px; font-weight: 700; text-transform: uppercase; color: #64748b; }
+        .param-value { font-size: 10px; font-weight: 800; font-family: monospace; color: #0f172a; }
+        table { width: 100%; border-collapse: collapse; margin-top: 4px; border: 1px solid black; }
+        th, td { border: 1px solid #94a3b8; padding: 3.5px 5px; text-align: left; font-size: 7.5px; }
+        th { background: #f1f5f9; font-weight: 800; text-transform: uppercase; font-size: 7.5px; color: #1e293b; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+        .font-mono { font-family: monospace; }
+        .font-bold { font-weight: bold; }
+        .btn-print { background: black; color: white; border: none; padding: 6px 14px; font-size: 10px; font-weight: bold; cursor: pointer; margin-bottom: 12px; text-transform: uppercase; border-radius: 4px; }
+        .inflex-box { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+        .signatures { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-top: 25px; page-break-inside: avoid; }
+        .sig-line { border-top: 1px solid black; text-align: center; font-size: 7.5px; padding-top: 4px; font-weight: bold; text-transform: uppercase; }
+        @media print { .btn-print { display: none; } }
+    </style>
+</head>
+<body>
+    <button class="btn-print" onclick="window.print()">Imprimir Laudo Técnico</button>
+    <div class="header">
+        <div>
+            <div class="title">Laudo Técnico de Auditoria e Liquidação de Comissões</div>
+            <div class="subtitle">Engenharia de Operações Financeiras • Rateio Dinâmico e Amortização de Fluxo</div>
+        </div>
+        <div class="meta-box">
+            <div><strong>Empreendimento:</strong> ${result.property.empreendimento || "-"} | <strong>Unid:</strong> ${result.property.unidade || "-"} / ${result.property.torre || "-"}</div>
+            <div><strong>Clientes:</strong> ${result.customers.map(c => c.nome).join(', ') || "-"}</div>
+            <div><strong>Emissão:</strong> ${new Date().toLocaleString('pt-BR')}</div>
+            <div style="margin-top: 3px;">
+                <span class="badge-status ${diag.secaoIII.statusConciliacao === '100% LIQUIDADO' ? 'badge-success' : 'badge-warning'}">
+                    STATUS: ${diag.secaoIII.statusConciliacao}
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- SEÇÃO I -->
+    <div class="section-title">Seção I: Memória de Cálculo e Parâmetros de Entrada</div>
+    <div class="params-grid">
+        <div class="param-item">
+            <span class="param-label">VGV Total da Proposta</span>
+            <span class="param-value">${formatCurrency(diag.secaoI.vgv)}</span>
+        </div>
+        <div class="param-item">
+            <span class="param-label">Taxa Global de Comissão (tc)</span>
+            <span class="param-value">${diag.secaoI.taxaGlobal.toFixed(2)}%</span>
+        </div>
+        <div class="param-item">
+            <span class="param-label">Passivo Total de Honorários (C_total)</span>
+            <span class="param-value">${formatCurrency(diag.secaoI.passivoTotalComissao)}</span>
+        </div>
+        <div class="param-item">
+            <span class="param-label">Consistência da Soma (∑ pj = tc)</span>
+            <span class="param-value">${diag.secaoI.somaAliquotas.toFixed(2)}% (${diag.secaoI.consistenciaAliquotas ? 'CONFORME' : 'DIVERGENTE'})</span>
+        </div>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 25%;">Cargo / Participante</th>
+                <th class="text-right" style="width: 12%;">Alíquota VGV (pj)</th>
+                <th class="text-right" style="width: 16%;">Teto Nominal (Tj)</th>
+                <th class="text-right" style="width: 14%;">Coef. Fluxo (wj)</th>
+                <th style="width: 18%;">Regra / Exceção</th>
+                <th style="width: 15%;">Hierarquia de Absorção</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${diag.secaoI.participantes.map(p => `
+                <tr>
+                    <td class="font-bold">${p.label}</td>
+                    <td class="text-right font-mono">${p.aliquotaVGV.toFixed(2)}%</td>
+                    <td class="text-right font-mono font-bold">${formatCurrency(p.tetoNominal)}</td>
+                    <td class="text-right font-mono">${p.regraFluxo > 0 ? p.regraFluxo.toFixed(2) + '%' : 'Partes Iguais (Em branco)'}</td>
+                    <td>${p.excecao}</td>
+                    <td>${p.tierLabel}</td>
+                </tr>
+            `).join('')}
+        </tbody>
+    </table>
+
+    <!-- SEÇÃO II -->
+    <div class="section-title">Seção II: Amortização do Fluxo de Recebíveis</div>
+    <table>
+        <thead>
+            <tr>
+                <th class="text-center" style="width: 5%;">#</th>
+                <th style="width: 12%;">Vencimento</th>
+                <th style="width: 25%;">Tipo de Parcela</th>
+                <th class="text-right" style="width: 15%;">Parcela Nominal Bruta</th>
+                <th class="text-right" style="width: 15%;">Dedução Aplicada (Retencao_i)</th>
+                <th class="text-right" style="width: 14%;">Saldo Incorporador</th>
+                <th class="text-right" style="width: 14%;">Saldo Devedor Comissão</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${diag.secaoII.map(row => `
+                <tr>
+                    <td class="text-center font-mono">${row.linha}</td>
+                    <td class="font-mono">${row.vencimento}</td>
+                    <td class="font-bold">${row.tipo}</td>
+                    <td class="text-right font-mono">${formatCurrency(row.parcelaBruta)}</td>
+                    <td class="text-right font-mono font-bold" style="color: #4338ca;">${formatCurrency(row.deducaoAplicada)}</td>
+                    <td class="text-right font-mono">${formatCurrency(row.saldoIncorporador)}</td>
+                    <td class="text-right font-mono font-bold" style="color: ${row.saldoDevedorComissao > 0.01 ? '#b45309' : '#15803d'};">${formatCurrency(row.saldoDevedorComissao)}</td>
+                </tr>
+            `).join('')}
+        </tbody>
+    </table>
+
+    <!-- SEÇÃO III -->
+    <div class="section-title">Seção III: Matriz Definitiva de Repasse (Vencimento a Vencimento)</div>
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 10%;">Vencimento</th>
+                <th style="width: 15%;">Tipo Parcela</th>
+                <th class="text-right" style="width: 12%;">Total Retido</th>
+                ${diag.secaoIII.headers.map(h => `<th class="text-right" style="max-width: 90px; word-break: break-word;">${h}</th>`).join('')}
+            </tr>
+        </thead>
+        <tbody>
+            ${diag.secaoIII.rows.map(row => `
+                <tr>
+                    <td class="font-mono">${row.vencimento}</td>
+                    <td>${row.tipo}</td>
+                    <td class="text-right font-mono font-bold" style="color: #4338ca;">${formatCurrency(row.valorRetido)}</td>
+                    ${diag.secaoIII.headers.map(h => {
+                        const val = row.distribuicao[h] || 0;
+                        return `<td class="text-right font-mono">${val > 0 ? formatCurrency(val) : '-'}</td>`;
+                    }).join('')}
+                </tr>
+            `).join('')}
+            <tr style="background: #f8fafc; font-weight: bold; border-top: 2px solid black;">
+                <td colspan="2" class="font-bold">TOTAL ACUMULADO REPASSADO</td>
+                <td class="text-right font-mono font-bold" style="color: #4338ca;">${formatCurrency(diag.secaoIII.totalRetido)}</td>
+                ${diag.secaoIII.headers.map(h => `
+                    <td class="text-right font-mono font-bold">${formatCurrency(diag.secaoIII.totaisPorParticipante[h] || 0)}</td>
+                `).join('')}
+            </tr>
+            <tr style="background: #f1f5f9; font-weight: bold;">
+                <td colspan="2" class="font-bold">TETO CONTRATUAL NOMINAL (Tj)</td>
+                <td class="text-right font-mono font-bold">${formatCurrency(diag.secaoI.passivoTotalComissao)}</td>
+                ${diag.secaoIII.headers.map(h => `
+                    <td class="text-right font-mono">${formatCurrency(diag.secaoIII.tetosPorParticipante[h] || 0)}</td>
+                `).join('')}
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- SEÇÃO IV -->
+    <div class="section-title">Seção IV: Diagnóstico de Eventos Críticos (Inflexões)</div>
+    <div class="inflex-box">
+        <div style="border: 1px solid #cbd5e1; padding: 8px; background: #f8fafc;">
+            <div style="font-size: 8px; font-weight: bold; text-transform: uppercase; margin-bottom: 6px; color: #1e293b;">Inflexões de Quitação (Saída da Esteira)</div>
+            ${diag.secaoIV.inflexoes.length > 0 ? `
+                <table style="margin-top: 0;">
+                    <thead>
+                        <tr>
+                            <th>Participante</th>
+                            <th>Evento de Quitação</th>
+                            <th>Vencimento</th>
+                            <th class="text-right">Teto Quitado</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${diag.secaoIV.inflexoes.map(inf => `
+                            <tr>
+                                <td class="font-bold">${inf.participante}</td>
+                                <td>${inf.parcelaQuitacao}</td>
+                                <td class="font-mono">${inf.vencimento}</td>
+                                <td class="text-right font-mono font-bold" style="color: #166534;">${formatCurrency(inf.tetoAtingido)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<div style="font-size: 8px; color: #64748b;">Nenhum participante atingiu quitação antecipada.</div>'}
+        </div>
+        <div style="border: 1px solid #cbd5e1; padding: 8px; background: #f8fafc;">
+            <div style="font-size: 8px; font-weight: bold; text-transform: uppercase; margin-bottom: 6px; color: #1e293b;">Hierarquia de Absorção e Liberação de Caixa</div>
+            <ul style="margin: 0; padding-left: 14px; font-size: 7.5px; color: #334155; line-height: 1.4;">
+                ${diag.secaoIV.rotasSobras.map(r => `<li>${r}</li>`).join('')}
+            </ul>
+            ${diag.secaoIV.liberacaoFluxoIntegral ? `
+                <div style="margin-top: 8px; padding: 6px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 4px;">
+                    <div style="font-weight: bold; color: #065f46; font-size: 8px; text-transform: uppercase;">
+                        ✓ Liberação Integral do Fluxo ao Incorporador: ${diag.secaoIV.liberacaoFluxoIntegral.parcela} (${diag.secaoIV.liberacaoFluxoIntegral.vencimento})
+                    </div>
+                    <div style="color: #047857; font-size: 7.5px; margin-top: 2px;">
+                        ${diag.secaoIV.liberacaoFluxoIntegral.observacao}
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+    </div>
+
+    <!-- ASSINATURAS -->
+    <div class="signatures">
+        <div class="sig-line">Incorporador / Vendedor</div>
+        <div class="sig-line">Imobiliária / Diretoria</div>
+        <div class="sig-line">Liderança / Gerente</div>
+        <div class="sig-line">Auditoria Financeira</div>
+    </div>
+</body>
+</html>
+    `;
+
+    const printWindow = window.open('', '_blank');
+    if (printWindow) {
+      printWindow.document.write(html);
+      printWindow.document.close();
+    }
+  };
+
+  const renderEspecialistaTabContent = () => {
+    if (!waterfallResult) return null;
+    const diag = gerarDiagnosticoEspecialista(waterfallResult);
+    const isLiquidado100 = diag.secaoIII.statusConciliacao === '100% LIQUIDADO';
+
+    const copiarRelatorioTexto = () => {
+      const text = `=== LAUDO TÉCNICO DE AUDITORIA E LIQUIDAÇÃO DE COMISSÕES ===
+Engenharia de Operações Financeiras • Rateio Dinâmico e Amortização de Fluxo
+Empreendimento: ${result?.property?.empreendimento || '-'} | Unidade: ${result?.property?.unidade || '-'} / ${result?.property?.torre || '-'}
+Clientes: ${result?.customers.map(c => c.nome).join(', ') || '-'}
+Status de Conciliação: ${diag.secaoIII.statusConciliacao}
+
+--- SEÇÃO I: MEMÓRIA DE CÁLCULO E PARÂMETROS DE ENTRADA ---
+- VGV Total (V_total): ${diag.secaoI.vgv.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+- Taxa Global de Comissão (t_c): ${diag.secaoI.taxaGlobal.toFixed(2)}%
+- Passivo Total de Honorários (C_total): ${diag.secaoI.passivoTotalComissao.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+- Consistência das Alíquotas: ${diag.secaoI.somaAliquotas.toFixed(2)}% (${diag.secaoI.consistenciaAliquotas ? 'CONFORME (∑ p_j = t_c)' : 'DIVERGENTE'})
+
+Participantes e Tetos Contratuais:
+${diag.secaoI.participantes.map(p => `• ${p.label} | Alíquota VGV: ${p.aliquotaVGV.toFixed(2)}% | Teto Nominal: ${p.tetoNominal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })} | Perc. Parcela: ${p.regraFluxo > 0 ? p.regraFluxo.toFixed(2) + '%' : 'Partes Iguais (Em branco)'} | Regra: ${p.excecao} | ${p.tierLabel}`).join('\n')}
+
+--- SEÇÃO II: AMORTIZAÇÃO DO FLUXO DE RECEBÍVEIS ---
+${diag.secaoII.map(r => `#${r.linha} | ${r.vencimento} | ${r.tipo} | Bruto: ${r.parcelaBruta.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })} | Retenção: ${r.deducaoAplicada.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })} | Líq. Incorporador: ${r.saldoIncorporador.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })} | Devedor: ${r.saldoDevedorComissao.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}`).join('\n')}
+
+--- SEÇÃO III: MATRIZ DEFINITIVA DE REPASSE (TOTAIS ACUMULADOS) ---
+Total Retido no Fluxo: ${diag.secaoIII.totalRetido.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+${diag.secaoIII.headers.map(h => `• ${h}: Repassado ${(diag.secaoIII.totaisPorParticipante[h] || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })} de ${(diag.secaoIII.tetosPorParticipante[h] || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}`).join('\n')}
+
+--- SEÇÃO IV: DIAGNÓSTICO DE EVENTOS CRÍTICOS (INFLEXÕES) ---
+${diag.secaoIV.inflexoes.map(inf => `• Quitação: ${inf.participante} em ${inf.parcelaQuitacao} (${inf.vencimento}) | Teto Quitado: ${inf.tetoAtingido.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}`).join('\n')}
+${diag.secaoIV.rotasSobras.map(r => `• ${r}`).join('\n')}
+${diag.secaoIV.liberacaoFluxoIntegral ? `• Liberação de Fluxo Integral ao Incorporador: a partir de ${diag.secaoIV.liberacaoFluxoIntegral.parcela} (${diag.secaoIV.liberacaoFluxoIntegral.vencimento})` : ''}
+`;
+      navigator.clipboard.writeText(text);
+      setCopiedRelatorio(true);
+      setTimeout(() => setCopiedRelatorio(false), 2500);
+    };
+
+    return (
+      <div className="space-y-6">
+        {/* Banner de Identidade do Especialista */}
+        <div className="bg-slate-900 text-white p-6 rounded-3xl border border-slate-800 shadow-xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                Engenharia de Operações Financeiras
+              </span>
+              <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider ${
+                isLiquidado100 
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' 
+                  : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+              }`}>
+                {diag.secaoIII.statusConciliacao}
+              </span>
+            </div>
+            <h3 className="text-lg font-black tracking-tight text-white flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-indigo-400" />
+              Laudo Técnico de Auditoria e Rateio de Comissões
+            </h3>
+            <p className="text-xs text-slate-400 max-w-2xl font-sans leading-relaxed">
+              Amortização cronológica subordinada à capacidade de retenção de cada evento (<span className="font-mono text-slate-300">Retencao_i</span>), com quitação individual de tetos (<span className="font-mono text-slate-300">T_j</span>), proteção de caixa e fechamento de centavos (soma zero).
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={copiarRelatorioTexto}
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition-all border border-slate-700 active:scale-[0.98]"
+            >
+              {copiedRelatorio ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+              {copiedRelatorio ? 'Copiado!' : 'Copiar Laudo'}
+            </button>
+            <button
+              onClick={printRelatorioEspecialista}
+              className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-indigo-600/30 active:scale-[0.98]"
+            >
+              <Printer className="w-4 h-4" />
+              Imprimir Laudo Técnico
+            </button>
+          </div>
+        </div>
+
+        {/* SEÇÃO I: MEMÓRIA DE CÁLCULO E PARÂMETROS DE ENTRADA */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h4 className="text-xs font-bold text-slate-600 uppercase tracking-widest flex items-center gap-2">
+              <FileSearch className="w-4 h-4 text-indigo-600" /> Seção I: Memória de Cálculo e Parâmetros de Entrada
+            </h4>
+            <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-lg font-mono ${
+              diag.secaoI.consistenciaAliquotas 
+                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' 
+                : 'bg-rose-50 text-rose-700 border border-rose-200'
+            }`}>
+              ∑ p_j = {diag.secaoI.somaAliquotas.toFixed(2)}% ({diag.secaoI.consistenciaAliquotas ? 'CONFORME t_c' : 'DIVERGENTE'})
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+              <span className="text-[10px] font-bold uppercase text-slate-400 tracking-wider">VGV Total (V_total)</span>
+              <div className="text-lg font-black font-mono text-slate-800 mt-1">
+                {diag.secaoI.vgv.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+              </div>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+              <span className="text-[10px] font-bold uppercase text-slate-400 tracking-wider">Taxa Global de Comissão (t_c)</span>
+              <div className="text-lg font-black font-mono text-indigo-600 mt-1">
+                {diag.secaoI.taxaGlobal.toFixed(2)}%
+              </div>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+              <span className="text-[10px] font-bold uppercase text-slate-400 tracking-wider">Passivo Total Honorários (C_total)</span>
+              <div className="text-lg font-black font-mono text-slate-800 mt-1">
+                {diag.secaoI.passivoTotalComissao.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+              </div>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+              <span className="text-[10px] font-bold uppercase text-slate-400 tracking-wider">Participantes na Esteira</span>
+              <div className="text-lg font-black font-mono text-slate-800 mt-1">
+                {diag.secaoI.participantes.length} <span className="text-xs font-normal text-slate-500">credores</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-2xl overflow-hidden border border-slate-200 shadow-sm overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold uppercase text-[10px]">
+                  <th className="p-3">Cargo / Participante</th>
+                  <th className="p-3 text-right">Alíquota s/ VGV (p_j)</th>
+                  <th className="p-3 text-right">Teto Nominal (T_j)</th>
+                  <th className="p-3 text-right">Coef. Fluxo (w_j)</th>
+                  <th className="p-3">Regra / Exceção Vinculada</th>
+                  <th className="p-3">Hierarquia de Absorção</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 font-sans">
+                {diag.secaoI.participantes.map((p, idx) => (
+                  <tr key={idx} className="hover:bg-slate-50/70 transition-colors">
+                    <td className="p-3 font-bold text-slate-800">{p.label}</td>
+                    <td className="p-3 text-right font-mono text-slate-700">{p.aliquotaVGV.toFixed(2)}%</td>
+                    <td className="p-3 text-right font-mono font-bold text-slate-900">
+                      {p.tetoNominal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                    <td className="p-3 text-right font-mono text-slate-600">
+                      {p.regraFluxo > 0 ? (
+                        `${p.regraFluxo.toFixed(2)}%`
+                      ) : (
+                        <span className="text-[10px] font-sans font-bold text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
+                          Partes Iguais (Em branco)
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-3">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${
+                        p.excecao.includes('100%') 
+                          ? 'bg-purple-50 text-purple-700 border border-purple-200' 
+                          : 'bg-slate-100 text-slate-700'
+                      }`}>
+                        {p.excecao}
+                      </span>
+                    </td>
+                    <td className="p-3">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700">
+                        {p.tierLabel}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* SEÇÃO II: AMORTIZAÇÃO DO FLUXO DE RECEBÍVEIS */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h4 className="text-xs font-bold text-slate-600 uppercase tracking-widest flex items-center gap-2">
+              <Clock className="w-4 h-4 text-indigo-600" /> Seção II: Amortização do Fluxo de Recebíveis
+            </h4>
+            <span className="text-[10px] text-slate-500 font-mono">
+              {diag.secaoII.length} eventos processados cronologicamente
+            </span>
+          </div>
+
+          <div className="bg-white rounded-2xl overflow-hidden border border-slate-200 shadow-sm overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs font-sans">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold uppercase text-[10px]">
+                  <th className="p-3 text-center w-12">#</th>
+                  <th className="p-3">Vencimento</th>
+                  <th className="p-3">Tipo de Parcela</th>
+                  <th className="p-3 text-right">Parcela Bruta</th>
+                  <th className="p-3 text-right text-indigo-600">Dedução Aplicada (Retencao_i)</th>
+                  <th className="p-3 text-right">Líquido Incorporador</th>
+                  <th className="p-3 text-right">Saldo Devedor Comissão</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {diag.secaoII.map((row, idx) => (
+                  <tr key={idx} className="hover:bg-slate-50/70 transition-colors">
+                    <td className="p-3 text-center font-mono text-slate-400 text-[11px]">{row.linha}</td>
+                    <td className="p-3 font-mono font-medium text-slate-700">{row.vencimento}</td>
+                    <td className="p-3 font-bold text-slate-800">{row.tipo}</td>
+                    <td className="p-3 text-right font-mono text-slate-700">
+                      {row.parcelaBruta.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                    <td className="p-3 text-right font-mono font-bold text-indigo-600">
+                      {row.deducaoAplicada.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                    <td className="p-3 text-right font-mono text-slate-600">
+                      {row.saldoIncorporador.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                    <td className={`p-3 text-right font-mono font-bold ${
+                      row.saldoDevedorComissao > 0.01 ? 'text-amber-600' : 'text-emerald-600'
+                    }`}>
+                      {row.saldoDevedorComissao.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* SEÇÃO III: MATRIZ DEFINITIVA DE REPASSE */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h4 className="text-xs font-bold text-slate-600 uppercase tracking-widest flex items-center gap-2">
+              <Table className="w-4 h-4 text-indigo-600" /> Seção III: Matriz Definitiva de Repasse (Vencimento a Vencimento)
+            </h4>
+            <span className="text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-lg font-mono font-bold">
+              Total Repassado: {diag.secaoIII.totalRetido.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+            </span>
+          </div>
+
+          <div className="bg-white rounded-2xl overflow-hidden border border-slate-200 shadow-sm overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs font-sans">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold uppercase text-[10px]">
+                  <th className="p-3 whitespace-nowrap">Vencimento</th>
+                  <th className="p-3 whitespace-nowrap">Tipo</th>
+                  <th className="p-3 text-right font-mono text-indigo-600 whitespace-nowrap">Total Retido</th>
+                  {diag.secaoIII.headers.map((h, hIdx) => (
+                    <th key={hIdx} className="p-3 text-right whitespace-nowrap max-w-[130px] truncate" title={h}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {diag.secaoIII.rows.map((row, rIdx) => (
+                  <tr key={rIdx} className="hover:bg-slate-50/70 transition-colors">
+                    <td className="p-3 font-mono text-slate-700 whitespace-nowrap">{row.vencimento}</td>
+                    <td className="p-3 font-bold text-slate-800 whitespace-nowrap">{row.tipo}</td>
+                    <td className="p-3 text-right font-mono font-bold text-indigo-600 whitespace-nowrap">
+                      {row.valorRetido.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                    {diag.secaoIII.headers.map((h, hIdx) => {
+                      const val = row.distribuicao[h] || 0;
+                      return (
+                        <td key={hIdx} className="p-3 text-right font-mono whitespace-nowrap text-slate-800">
+                          {val > 0 ? val.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : '-'}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+                {/* Linhas de Conferência Contábil */}
+                <tr className="bg-slate-100 font-bold border-t-2 border-slate-300">
+                  <td colSpan={2} className="p-3 font-bold text-slate-800 uppercase text-[11px]">
+                    Total Acumulado Repassado
+                  </td>
+                  <td className="p-3 text-right font-mono font-bold text-indigo-700 whitespace-nowrap">
+                    {diag.secaoIII.totalRetido.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                  </td>
+                  {diag.secaoIII.headers.map((h, hIdx) => (
+                    <td key={hIdx} className="p-3 text-right font-mono font-bold text-emerald-700 whitespace-nowrap">
+                      {(diag.secaoIII.totaisPorParticipante[h] || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                  ))}
+                </tr>
+                <tr className="bg-slate-50 font-bold text-slate-500">
+                  <td colSpan={2} className="p-3 font-bold uppercase text-[10px]">
+                    Teto Contratual Nominal (T_j)
+                  </td>
+                  <td className="p-3 text-right font-mono whitespace-nowrap">
+                    {diag.secaoI.passivoTotalComissao.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                  </td>
+                  {diag.secaoIII.headers.map((h, hIdx) => (
+                    <td key={hIdx} className="p-3 text-right font-mono whitespace-nowrap">
+                      {(diag.secaoIII.tetosPorParticipante[h] || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                  ))}
+                </tr>
+                <tr className="bg-white font-bold text-[10px]">
+                  <td colSpan={2} className="p-3 uppercase text-slate-400">
+                    Diferença Residual (Fechamento de Centavos)
+                  </td>
+                  <td className="p-3 text-right font-mono text-slate-400">
+                    R$ 0,00
+                  </td>
+                  {diag.secaoIII.headers.map((h, hIdx) => {
+                    const diff = Number(((diag.secaoIII.tetosPorParticipante[h] || 0) - (diag.secaoIII.totaisPorParticipante[h] || 0)).toFixed(2));
+                    return (
+                      <td key={hIdx} className={`p-3 text-right font-mono whitespace-nowrap ${
+                        Math.abs(diff) < 0.01 ? 'text-slate-400' : 'text-amber-600'
+                      }`}>
+                        {diff.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                      </td>
+                    );
+                  })}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* SEÇÃO IV: DIAGNÓSTICO DE EVENTOS CRÍTICOS (INFLEXÕES) */}
+        <div className="space-y-4">
+          <h4 className="text-xs font-bold text-slate-600 uppercase tracking-widest flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-indigo-600" /> Seção IV: Diagnóstico de Eventos Críticos (Inflexões)
+          </h4>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Inflexões de Quitação */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3">
+              <h5 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                Inflexões de Quitação de Credores (Saída da Esteira)
+              </h5>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Identificação do evento exato em que cada participante atinge 100% de seu teto financeiro nominal (<span className="font-mono">T_j</span>) e cessa de reter valores do fluxo de recebíveis.
+              </p>
+              {diag.secaoIV.inflexoes.length > 0 ? (
+                <div className="space-y-2 mt-3">
+                  {diag.secaoIV.inflexoes.map((inf, idx) => (
+                    <div key={idx} className="p-3 bg-slate-50 rounded-xl border border-slate-100 flex items-center justify-between">
+                      <div>
+                        <div className="text-xs font-bold text-slate-800">{inf.participante}</div>
+                        <div className="text-[11px] text-slate-500 font-mono mt-0.5">
+                          {inf.parcelaQuitacao} • {inf.vencimento}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-xs font-bold font-mono text-emerald-600">
+                          {inf.tetoAtingido.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                        </div>
+                        <span className="text-[9px] font-bold uppercase text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                          Teto Quitado
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="p-4 bg-slate-50 rounded-xl text-center text-xs text-slate-500">
+                  Nenhum participante encerrou quitação antecipada.
+                </div>
+              )}
+            </div>
+
+            {/* Rotas de Absorção e Liberação de Fluxo */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3 flex flex-col justify-between">
+              <div>
+                <h5 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                  <Workflow className="w-4 h-4 text-indigo-500" />
+                  Hierarquia de Absorção de Sobras (Cascata)
+                </h5>
+                <ul className="mt-3 space-y-2 text-xs text-slate-600">
+                  {diag.secaoIV.rotasSobras.map((rota, idx) => (
+                    <li key={idx} className="p-2.5 bg-slate-50 rounded-xl border border-slate-100 flex items-start gap-2">
+                      <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 shrink-0" />
+                      <span>{rota}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {diag.secaoIV.liberacaoFluxoIntegral && (
+                <div className="mt-4 p-4 bg-emerald-50 border border-emerald-200 rounded-2xl">
+                  <div className="flex items-center gap-2 text-emerald-800 font-bold text-xs">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    Liberação Integral de Fluxo ao Incorporador: {diag.secaoIV.liberacaoFluxoIntegral.parcela}
+                  </div>
+                  <p className="text-xs text-emerald-700 mt-1">
+                    Vencimento: <strong>{diag.secaoIV.liberacaoFluxoIntegral.vencimento}</strong>. {diag.secaoIV.liberacaoFluxoIntegral.observacao}
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderRateio = () => {
     if (!waterfallResult) {
       return (
@@ -6239,22 +7868,26 @@ export default function App() {
         setIsEditingRateio(false);
         setTimeout(() => {
           const currentEmp = empreendimentos.find(e => e.nome === result.property.empreendimento);
+          const effectivePercentual = percentualComissao;
+
           const sim = processarProposta(
             result.payments, 
-            percentualComissao, 
+            effectivePercentual, 
             currentEmp?.regras_comissao, 
             installmentConfigs,
-            result.forma_pagamento_comissao
+            result.forma_pagamento_comissao,
+            result.valorTotalProposta
           );
           
           const sumExcluded = result.payments
             .filter(p => isExcludedFromCommissionBase(p.tipo))
             .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-          const baseVendaTotal = Math.max(0, (result.valorTotalProposta || result.payments.reduce((acc, p) => acc + p.valorTotal, 0)) - sumExcluded);
+          const sumAllParcelas = result.payments.reduce((acc, p) => acc + (p.valorTotal || 0), 0);
+          const baseVendaTotal = Math.max(0, (sumAllParcelas > 0 ? sumAllParcelas : (result.valorTotalProposta || 0)) - sumExcluded);
 
           const waterfall = calcularRateioCascata(
             baseVendaTotal,
-            percentualComissao,
+            effectivePercentual,
             sim.fluxo,
             result.forma_pagamento_comissao,
             commissionedParties,
@@ -6341,6 +7974,19 @@ export default function App() {
             >
               <Calendar className="w-4 h-4" />
               EXPORTAR CALENDÁRIO (.ICS)
+            </button>
+            <button 
+              onClick={() => exportRateioToWebropay(waterfallResult)}
+              disabled={isExportingWebropay}
+              className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm active:scale-[0.98] disabled:bg-emerald-400"
+              title="Gerar Planilha Webropay modelo contrato (.xlsx) com abas Beneficiários e Pagador"
+            >
+              {isExportingWebropay ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <FileSpreadsheet className="w-4 h-4" />
+              )}
+              {isExportingWebropay ? 'GERANDO PLANILHA...' : 'GERAR PLANILHA WEBROPAY'}
             </button>
           </div>
         </header>
@@ -6433,15 +8079,25 @@ export default function App() {
                 </div>
               )}
               {hasCommissionMismatch && (
-                <div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start gap-3">
-                  <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
-                  <div>
-                    <h5 className="text-xs font-bold text-red-800 uppercase tracking-wider">Divergência de Percentuais</h5>
-                    <p className="text-xs text-red-700 mt-1">
-                      A soma dos percentuais dos cargos (<strong>{sumCargosPercentage.toFixed(2)}%</strong>) diverge do percentual total de comissão contratado (<strong>{percentualComissao.toFixed(2)}%</strong>). 
-                      Por favor, ajuste as taxas para garantir a conformidade dos cálculos.
-                    </p>
+                <div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+                    <div>
+                      <h5 className="text-xs font-bold text-red-800 uppercase tracking-wider">Divergência de Percentuais</h5>
+                      <p className="text-xs text-red-700 mt-1">
+                        A soma dos percentuais dos cargos (<strong>{sumCargosPercentage.toFixed(2)}%</strong>) diverge do percentual total de comissão contratado (<strong>{percentualComissao.toFixed(2)}%</strong>).
+                      </p>
+                    </div>
                   </div>
+                  <button
+                    onClick={() => {
+                      setPercentualComissao(Number(sumCargosPercentage.toFixed(2)));
+                      setTimeout(handleRecalculateAll, 50);
+                    }}
+                    className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-[10px] font-bold transition-all shadow-sm shrink-0 uppercase whitespace-nowrap"
+                  >
+                    Sincronizar ({sumCargosPercentage.toFixed(2)}%)
+                  </button>
                 </div>
               )}
               {hasCoverageShortage && (
@@ -6485,6 +8141,17 @@ export default function App() {
               <Users className="w-4 h-4" />
               Lista de Cargos
             </button>
+            <button
+              onClick={() => setRateioTab('especialista')}
+              className={`pb-4 px-1 border-b-2 font-bold text-sm transition-all flex items-center gap-2 ${
+                rateioTab === 'especialista'
+                  ? 'border-indigo-600 text-indigo-600'
+                  : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+              }`}
+            >
+              <ShieldCheck className="w-4 h-4" />
+              Laudo Técnico Especialista (4 Seções)
+            </button>
           </div>
           {rateioTab === 'cargos' && (
             <button
@@ -6493,6 +8160,15 @@ export default function App() {
             >
               <Maximize2 className="w-3.5 h-3.5" />
               Preencher em Janela
+            </button>
+          )}
+          {rateioTab === 'especialista' && (
+            <button
+              onClick={printRelatorioEspecialista}
+              className="mb-3 flex items-center gap-1.5 px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition-all shadow-sm active:scale-[0.98]"
+            >
+              <Printer className="w-3.5 h-3.5" />
+              Imprimir Laudo Técnico
             </button>
           )}
         </div>
@@ -6504,9 +8180,14 @@ export default function App() {
               <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
                 <Users className="w-4 h-4" /> Configuração de Cargos e Participantes
               </h4>
-              <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-lg font-medium">
-                Cargos marcados como &quot;Ocultar&quot; são excluídos das tabelas e seu valor é agrupado na Imobiliária
-              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-lg font-medium">
+                  Perc. Parcela em branco distribui o saldo da parcela proporcionalmente à alíquota de cada cargo
+                </span>
+                <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-lg font-medium">
+                  Cargos marcados como &quot;Ocultar&quot; são agrupados na Imobiliária
+                </span>
+              </div>
             </div>
             <div className="bg-white rounded-2xl overflow-hidden border border-slate-100 shadow-sm overflow-x-auto">
               <table className="w-full text-left border-collapse">
@@ -6563,6 +8244,8 @@ export default function App() {
                               const newParties = [...commissionedParties];
                               newParties[idx].percentage = parseFloat(e.target.value) || 0;
                               setCommissionedParties(newParties);
+                              const sumRates = newParties.reduce((acc, cp) => acc + (cp.percentage || 0), 0);
+                              setPercentualComissao(Number(sumRates.toFixed(2)));
                             }}
                             className="w-full text-xs font-mono text-center text-indigo-600 bg-slate-50 rounded-lg border border-slate-100 py-1 focus:border-indigo-300 focus:bg-white outline-none"
                           />
@@ -6571,13 +8254,16 @@ export default function App() {
                           <input 
                             type="number"
                             step="0.01"
-                            value={p.deduction}
+                            value={p.deduction === 0 || p.deduction === undefined ? '' : p.deduction}
+                            placeholder="Proporcional"
+                            title="Deixe em branco para distribuir o saldo da parcela proporcionalmente à alíquota contratual do cargo"
                             onChange={(e) => {
                               const newParties = [...commissionedParties];
-                              newParties[idx].deduction = parseFloat(e.target.value) || 0;
+                              const val = e.target.value === '' ? 0 : parseFloat(e.target.value);
+                              newParties[idx].deduction = isNaN(val) ? 0 : val;
                               setCommissionedParties(newParties);
                             }}
-                            className="w-full text-xs font-mono text-center text-slate-600 bg-slate-50 rounded-lg border border-slate-100 py-1 focus:border-indigo-300 focus:bg-white outline-none"
+                            className="w-full text-xs font-mono text-center placeholder:text-slate-400 placeholder:italic text-slate-700 bg-slate-50 rounded-lg border border-slate-200 py-1 focus:border-indigo-300 focus:bg-white outline-none"
                           />
                         </td>
                         <td className="p-4 relative">
@@ -6672,6 +8358,8 @@ export default function App() {
                             onClick={() => {
                               const newParties = commissionedParties.filter((_, i) => i !== idx);
                               setCommissionedParties(newParties);
+                              const sumRates = newParties.reduce((acc, cp) => acc + (cp.percentage || 0), 0);
+                              setPercentualComissao(Number(sumRates.toFixed(2)));
                             }}
                             className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
                           >
@@ -6694,6 +8382,8 @@ export default function App() {
               </div>
             </div>
           </div>
+        ) : rateioTab === 'especialista' ? (
+          renderEspecialistaTabContent()
         ) : (
           <>
             {/* Participantes e Tetos */}
@@ -6710,7 +8400,7 @@ export default function App() {
                       <div className="z-10">
                         <header className="flex items-center justify-between mb-3">
                           <span className="text-[10px] font-bold text-slate-400 uppercase truncate max-w-[150px]" title={label}>{label}</span>
-                          <span className="text-[10px] font-bold text-indigo-600 font-mono bg-indigo-50 px-2 py-0.5 rounded">{(p.percentage / (p.name ? p.name.split(',').length : 1)).toFixed(2)}%</span>
+                          <span className="text-[10px] font-bold text-indigo-600 font-mono bg-indigo-50 px-2 py-0.5 rounded">{p.percentage.toFixed(2)}%</span>
                         </header>
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
@@ -6724,17 +8414,24 @@ export default function App() {
                         </div>
                       </div>
                       <div className="mt-4">
-                        <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
-                          <motion.div 
-                            initial={{ width: 0 }}
-                            animate={{ width: `${Math.min(100, (p.received / p.cap) * 100)}%` }}
-                            className={`h-full ${p.balance === 0 ? 'bg-emerald-500' : 'bg-indigo-500'}`}
-                          />
-                        </div>
-                        <div className="flex justify-between mt-2">
-                          <span className="text-[8px] font-bold text-slate-400 uppercase">Progresso</span>
-                          <span className="text-[8px] font-bold text-slate-400 font-mono">{Math.round((p.received / p.cap) * 100)}%</span>
-                        </div>
+                        {(() => {
+                          const progressPercent = p.cap > 0 ? Math.min(100, Math.round((p.received / p.cap) * 100)) : 0;
+                          return (
+                            <>
+                              <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                                <motion.div 
+                                  initial={{ width: 0 }}
+                                  animate={{ width: `${progressPercent}%` }}
+                                  className={`h-full ${p.balance <= 0.01 ? 'bg-emerald-500' : 'bg-indigo-500'}`}
+                                />
+                              </div>
+                              <div className="flex justify-between mt-2">
+                                <span className="text-[8px] font-bold text-slate-400 uppercase">Progresso</span>
+                                <span className="text-[8px] font-bold text-slate-400 font-mono">{progressPercent}%</span>
+                              </div>
+                            </>
+                          );
+                        })()}
                       </div>
                     </div>
                   );
@@ -6765,9 +8462,15 @@ export default function App() {
                           <th className={`${thPad} ${thFont} font-bold text-indigo-600 uppercase text-right align-top whitespace-nowrap min-w-[95px]`}>Comissão Parcela</th>
                           {waterfallResult.participantes.map((p, pIdx) => {
                             const label = p.name ? `${p.role} - ${p.name}` : p.role;
+                            const apelido = getParticipantApelido(p.name);
                             return (
                               <th key={pIdx} className={`${thPad} ${thFont} font-bold text-slate-400 uppercase text-right align-top min-w-[85px]`}>
-                                <div className="leading-snug break-words max-w-[130px] ml-auto" title={label}>{label}</div>
+                                <div className="leading-tight text-right ml-auto" title={label}>
+                                  <div className="font-bold text-slate-700 dark:text-slate-200 uppercase">{p.role}</div>
+                                  {apelido && (
+                                    <div className="font-medium text-slate-500 normal-case mt-0.5">{apelido}</div>
+                                  )}
+                                </div>
                                 {isEditingRateio && (
                                   <div className="mt-1.5 pt-1.5 border-t border-slate-200 text-[8.5px] font-mono normal-case text-right font-normal space-y-0.5">
                                     <div className="text-slate-500 whitespace-nowrap">
@@ -6797,9 +8500,7 @@ export default function App() {
                               : null;
 
                             const vencimentoToShow = correspondingSimFluxo ? correspondingSimFluxo.vencimento : det.vencimento;
-                            const valorComissaoToShow = correspondingSimFluxo 
-                              ? Number((correspondingSimFluxo.valorTotal - correspondingSimFluxo.valorLiquido).toFixed(2)) 
-                              : det.valorRetido;
+                            const valorComissaoToShow = det.valorRetido;
 
                             if (valorComissaoToShow > 0) {
                               visibleParcelas.push({
@@ -7145,6 +8846,16 @@ export default function App() {
                     onChange={(e) => setEmpreendimentoForm(prev => ({ ...prev, localizacao: e.target.value }))}
                     className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:ring-2 focus:ring-indigo-500/10 focus:border-indigo-500 outline-none transition-all placeholder:text-slate-400 text-sm font-medium"
                     placeholder="Ex: Guarulhos - SP"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Endereço do Empreendimento</label>
+                  <input
+                    type="text"
+                    value={empreendimentoForm.endereco || ''}
+                    onChange={(e) => setEmpreendimentoForm(prev => ({ ...prev, endereco: e.target.value }))}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:ring-2 focus:ring-indigo-500/10 focus:border-indigo-500 outline-none transition-all placeholder:text-slate-400 text-sm font-medium"
+                    placeholder="Ex: Av. Tiradentes, 1500, Jardim Bom Clima, Guarulhos - SP"
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
@@ -7992,6 +9703,43 @@ export default function App() {
             ))}
           </tbody>
         </table>
+      </div>
+
+      {/* Authentication methods and settings guidance */}
+      <div className="p-6 bg-slate-50/80 border-t border-slate-100">
+        <div className="flex items-start gap-4">
+          <div className="w-10 h-10 rounded-xl bg-indigo-100 flex items-center justify-center text-indigo-600 shrink-0 mt-0.5">
+            <ShieldCheck className="w-5 h-5" />
+          </div>
+          <div className="space-y-2 text-xs text-slate-600">
+            <h4 className="text-sm font-bold text-slate-800">Métodos de Autenticação Disponíveis</h4>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+              <div className="p-3 bg-white rounded-xl border border-slate-200/80 shadow-xs">
+                <div className="flex items-center gap-2 font-semibold text-slate-800 mb-1">
+                  <Mail className="w-4 h-4 text-emerald-600" />
+                  <span>E-mail e Senha (Sem Authenticator)</span>
+                </div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Permite aos usuários acessarem e criarem conta diretamente com senha cadastrada. <strong>Não exige código de 2FA nem aplicativo Google Authenticator.</strong>
+                </p>
+              </div>
+
+              <div className="p-3 bg-white rounded-xl border border-slate-200/80 shadow-xs">
+                <div className="flex items-center gap-2 font-semibold text-slate-800 mb-1">
+                  <Users className="w-4 h-4 text-indigo-600" />
+                  <span>Conta Google (SSO)</span>
+                </div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Acesso rápido via popup do Google. Caso o usuário tenha Verificação em Duas Etapas configurada na sua conta Google, ela será solicitada pelo Google.
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3 bg-indigo-50/60 rounded-xl border border-indigo-100/80 text-[11px] text-indigo-900 mt-2">
+              <strong>Onde gerenciar os métodos no Firebase:</strong> No Firebase Console do projeto (<code className="font-mono bg-indigo-100/80 px-1 py-0.5 rounded">gen-lang-client-0830787405</code>), acesse <strong>Authentication &gt; Sign-in method</strong> para ativar, desativar ou configurar novos provedores de acesso.
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -10028,19 +11776,37 @@ export default function App() {
 
           {/* Alert panel in modal */}
           {hasCommissionMismatch && (
-            <div className="mx-6 mt-4 bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start gap-3 shrink-0">
-              <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
-              <div>
-                <h5 className="text-xs font-bold text-red-800 uppercase tracking-wider">Divergência de Percentuais</h5>
-                <p className="text-xs text-red-700 mt-1">
-                  A soma dos percentuais dos cargos (<strong>{sumCargosPercentage.toFixed(2)}%</strong>) diverge do percentual total de comissão contratado (<strong>{percentualComissao.toFixed(2)}%</strong>).
-                </p>
+            <div className="mx-6 mt-4 bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start justify-between gap-3 shrink-0">
+              <div className="flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+                <div>
+                  <h5 className="text-xs font-bold text-red-800 uppercase tracking-wider">Divergência de Percentuais</h5>
+                  <p className="text-xs text-red-700 mt-1">
+                    A soma dos percentuais dos cargos (<strong>{sumCargosPercentage.toFixed(2)}%</strong>) diverge do percentual total de comissão contratado (<strong>{percentualComissao.toFixed(2)}%</strong>).
+                  </p>
+                </div>
               </div>
+              <button
+                onClick={() => {
+                  setPercentualComissao(Number(sumCargosPercentage.toFixed(2)));
+                }}
+                className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-[10px] font-bold transition-all shadow-sm shrink-0 uppercase whitespace-nowrap"
+              >
+                Sincronizar ({sumCargosPercentage.toFixed(2)}%)
+              </button>
             </div>
           )}
 
           {/* Content / Fillable List */}
           <div className="p-6 overflow-y-auto space-y-4 flex-1">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-lg font-medium">
+                Perc. Parcela em branco distribui o saldo da parcela proporcionalmente à alíquota de cada cargo (respeitando os tetos)
+              </span>
+              <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-lg font-medium">
+                Cargos marcados como &quot;Ocultar&quot; têm sua comissão somada na Imobiliária
+              </span>
+            </div>
             <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
               <table className="w-full text-left border-collapse">
                 <thead>
@@ -10096,6 +11862,8 @@ export default function App() {
                               const newParties = [...commissionedParties];
                               newParties[idx].percentage = parseFloat(e.target.value) || 0;
                               setCommissionedParties(newParties);
+                              const sumRates = newParties.reduce((acc, cp) => acc + (cp.percentage || 0), 0);
+                              setPercentualComissao(Number(sumRates.toFixed(2)));
                             }}
                             className="w-full text-xs font-mono text-center text-indigo-600 bg-slate-50/50 rounded-lg border border-slate-200 py-1.5 focus:border-indigo-300 focus:bg-white outline-none"
                           />
@@ -10104,13 +11872,16 @@ export default function App() {
                           <input 
                             type="number"
                             step="0.01"
-                            value={p.deduction}
+                            value={p.deduction === 0 || p.deduction === undefined ? '' : p.deduction}
+                            placeholder="Proporcional"
+                            title="Deixe em branco para distribuir o saldo da parcela proporcionalmente à alíquota contratual do cargo"
                             onChange={(e) => {
                               const newParties = [...commissionedParties];
-                              newParties[idx].deduction = parseFloat(e.target.value) || 0;
+                              const val = e.target.value === '' ? 0 : parseFloat(e.target.value);
+                              newParties[idx].deduction = isNaN(val) ? 0 : val;
                               setCommissionedParties(newParties);
                             }}
-                            className="w-full text-xs font-mono text-center text-slate-600 bg-slate-50/50 rounded-lg border border-slate-200 py-1.5 focus:border-indigo-300 focus:bg-white outline-none"
+                            className="w-full text-xs font-mono text-center placeholder:text-slate-400 placeholder:italic text-slate-700 bg-slate-50/50 rounded-lg border border-slate-200 py-1.5 focus:border-indigo-300 focus:bg-white outline-none"
                           />
                         </td>
                         <td className="p-4 relative">
@@ -10205,6 +11976,8 @@ export default function App() {
                             onClick={() => {
                               const newParties = commissionedParties.filter((_, i) => i !== idx);
                               setCommissionedParties(newParties);
+                              const sumRates = newParties.reduce((acc, cp) => acc + (cp.percentage || 0), 0);
+                              setPercentualComissao(Number(sumRates.toFixed(2)));
                             }}
                             className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
                           >
@@ -10426,30 +12199,41 @@ export default function App() {
               </div>
 
               {/* Method Selector Tabs */}
-              <div className="flex p-1 bg-slate-100 rounded-xl mb-6">
+              <div className="grid grid-cols-2 p-1.5 bg-slate-100/90 rounded-2xl mb-6 gap-1 border border-slate-200/60">
                 <button
                   type="button"
-                  onClick={() => { setAuthMode('google'); setAuthError(null); setAuthSuccessMessage(null); }}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-semibold rounded-lg transition-all ${
-                    authMode === 'google'
-                      ? 'bg-white text-indigo-600 shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <Users className="w-4 h-4" />
-                  Conta Google
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setAuthMode('email'); setAuthError(null); setAuthSuccessMessage(null); }}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-semibold rounded-lg transition-all ${
+                  onClick={() => switchAuthMode('email')}
+                  className={`flex flex-col items-center justify-center py-2.5 px-3 rounded-xl text-xs font-semibold transition-all ${
                     authMode === 'email'
-                      ? 'bg-white text-indigo-600 shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900'
+                      ? 'bg-white text-indigo-600 shadow-sm border border-slate-200/70'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
                   }`}
                 >
-                  <Mail className="w-4 h-4" />
-                  E-mail e Senha
+                  <div className="flex items-center gap-1.5 text-sm font-bold">
+                    <Mail className="w-4 h-4" />
+                    <span>E-mail e Senha</span>
+                  </div>
+                  <span className="text-[10px] font-normal text-emerald-600 font-mono mt-0.5">
+                    Sem Authenticator / 2FA
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => switchAuthMode('google')}
+                  className={`flex flex-col items-center justify-center py-2.5 px-3 rounded-xl text-xs font-semibold transition-all ${
+                    authMode === 'google'
+                      ? 'bg-white text-indigo-600 shadow-sm border border-slate-200/70'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-sm font-bold">
+                    <Users className="w-4 h-4" />
+                    <span>Conta Google</span>
+                  </div>
+                  <span className="text-[10px] font-normal text-slate-500 font-mono mt-0.5">
+                    Google SSO
+                  </span>
                 </button>
               </div>
 
@@ -10459,14 +12243,14 @@ export default function App() {
                   <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
                   <div className="flex-1">
                     <p className="font-semibold mb-1">Atenção</p>
-                    <p className="leading-relaxed">{authError}</p>
+                    <p className="leading-relaxed text-xs">{authError}</p>
                     {authMode === 'google' && (
                       <button
                         type="button"
-                        onClick={() => { setAuthMode('email'); setAuthError(null); }}
+                        onClick={() => switchAuthMode('email')}
                         className="mt-2 text-indigo-600 font-semibold hover:underline text-xs block"
                       >
-                        Alternar para login com E-mail e Senha →
+                        Alternar para login com E-mail e Senha (Sem Authenticator) →
                       </button>
                     )}
                   </div>
@@ -10477,41 +12261,22 @@ export default function App() {
               {authSuccessMessage && (
                 <div className="mb-6 p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-3 text-emerald-800 text-sm">
                   <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-                  <p className="leading-relaxed">{authSuccessMessage}</p>
+                  <p className="leading-relaxed text-xs">{authSuccessMessage}</p>
                 </div>
               )}
 
-              {authMode === 'google' ? (
-                <div className="space-y-4 text-center">
-                  <p className="text-slate-500 text-sm leading-relaxed mb-4">
-                    Conecte-se com sua conta Google para carregar suas propostas, configurações e permissões.
-                  </p>
-                  <button 
-                    type="button"
-                    onClick={signInWithGoogle}
-                    disabled={isAuthSubmitting}
-                    className="w-full flex items-center justify-center gap-3 px-6 py-3.5 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 disabled:opacity-60 active:scale-98"
-                  >
-                    {isAuthSubmitting ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        Conectando...
-                      </>
-                    ) : (
-                      <>
-                        <Users className="w-5 h-5" />
-                        Entrar com Google
-                      </>
-                    )}
-                  </button>
-                  <p className="text-xs text-slate-400 mt-3">
-                    Se o navegador bloquear janelas pop-up, utilize a aba de E-mail acima.
-                  </p>
-                </div>
-              ) : (
+              {authMode === 'email' ? (
                 <form onSubmit={handleEmailAuth} className="space-y-4">
+                  {/* Informational banner about No Authenticator needed */}
+                  <div className="p-3 bg-emerald-50/70 border border-emerald-200/80 rounded-xl flex items-start gap-2.5 text-emerald-900 text-xs">
+                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    <p className="leading-snug">
+                      <strong>Acesso Direto por Senha:</strong> Não solicita aplicativo Authenticator nem verificação em duas etapas. Basta preencher seu e-mail e senha.
+                    </p>
+                  </div>
+
                   {/* Register vs Login toggle */}
-                  <div className="flex items-center justify-between text-xs text-slate-500 mb-2 border-b border-slate-100 pb-2">
+                  <div className="flex items-center justify-between text-xs text-slate-500 border-b border-slate-100 pb-2">
                     <span className="font-medium text-slate-700">
                       {isRegistering ? 'Criar nova conta de acesso' : 'Fazer login com e-mail'}
                     </span>
@@ -10541,7 +12306,18 @@ export default function App() {
                   )}
 
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">E-mail</label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-semibold text-slate-700">E-mail</label>
+                      {authEmail !== 'propostasrej@gmail.com' && (
+                        <button
+                          type="button"
+                          onClick={() => setAuthEmail('propostasrej@gmail.com')}
+                          className="text-[11px] text-indigo-600 hover:underline font-mono"
+                        >
+                          Usar propostasrej@gmail.com
+                        </button>
+                      )}
+                    </div>
                     <div className="relative">
                       <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
                       <input
@@ -10572,13 +12348,21 @@ export default function App() {
                     <div className="relative">
                       <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
                       <input
-                        type="password"
+                        type={showAuthPassword ? "text" : "password"}
                         required
                         value={authPassword}
                         onChange={(e) => setAuthPassword(e.target.value)}
                         placeholder={isRegistering ? "Mínimo 6 caracteres" : "Sua senha"}
-                        className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white"
+                        className="w-full pl-9 pr-10 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white"
                       />
+                      <button
+                        type="button"
+                        onClick={() => setShowAuthPassword(!showAuthPassword)}
+                        className="absolute right-3 top-2.5 p-0.5 text-slate-400 hover:text-slate-600"
+                        title={showAuthPassword ? "Ocultar senha" : "Exibir senha"}
+                      >
+                        {showAuthPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
                     </div>
                   </div>
 
@@ -10605,12 +12389,69 @@ export default function App() {
                     )}
                   </button>
                 </form>
+              ) : (
+                <div className="space-y-4 text-center">
+                  <p className="text-slate-500 text-sm leading-relaxed mb-4">
+                    Conecte-se com sua conta Google para carregar suas propostas, configurações e permissões.
+                  </p>
+                  <button 
+                    type="button"
+                    onClick={signInWithGoogle}
+                    disabled={isAuthSubmitting}
+                    className="w-full flex items-center justify-center gap-3 px-6 py-3.5 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 disabled:opacity-60 active:scale-98"
+                  >
+                    {isAuthSubmitting ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Conectando...
+                      </>
+                    ) : (
+                      <>
+                        <Users className="w-5 h-5" />
+                        Entrar com Google
+                      </>
+                    )}
+                  </button>
+                  
+                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-left text-xs text-slate-600 space-y-2 mt-4">
+                    <p className="font-semibold text-slate-800 flex items-center gap-1.5">
+                      <KeyRound className="w-3.5 h-3.5 text-indigo-600" />
+                      Sua conta Google solicita o Authenticator?
+                    </p>
+                    <p className="text-[11px] leading-relaxed text-slate-500">
+                      Se o seu e-mail Google possui Verificação em Duas Etapas (2FA) ativa, o Google pedirá o código do app Authenticator.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => switchAuthMode('email')}
+                      className="w-full py-2 px-3 bg-white border border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold rounded-lg text-xs transition-colors flex items-center justify-center gap-1.5 shadow-sm"
+                    >
+                      <Mail className="w-3.5 h-3.5" />
+                      Entrar por E-mail e Senha (Sem Authenticator)
+                    </button>
+                  </div>
+                </div>
               )}
 
-              <div className="mt-8 pt-4 border-t border-slate-100 text-center">
-                <p className="text-[11px] text-slate-400">
-                  O e-mail oficial de administração é <strong className="text-slate-600">propostasrej@gmail.com</strong>.
-                </p>
+              {/* Where to adjust guide */}
+              <div className="mt-6 pt-4 border-t border-slate-100 text-left">
+                <details className="group text-xs text-slate-500">
+                  <summary className="cursor-pointer font-semibold text-slate-700 hover:text-indigo-600 flex items-center justify-between">
+                    <span>Onde ajustar e configurar métodos de login?</span>
+                    <span className="text-slate-400 group-open:rotate-180 transition-transform">▾</span>
+                  </summary>
+                  <div className="mt-2.5 p-3 bg-slate-50 rounded-xl space-y-2 border border-slate-100 text-[11px] text-slate-600">
+                    <p>
+                      <strong>1. No Aplicativo:</strong> Alterne entre as abas <strong>E-mail e Senha</strong> e <strong>Conta Google</strong> no topo desta janela.
+                    </p>
+                    <p>
+                      <strong>2. No Firebase Console:</strong> Acesse o painel do projeto (<code className="bg-slate-200 px-1 py-0.5 rounded text-[10px]">console.firebase.google.com</code>) &gt; <strong>Authentication</strong> &gt; aba <strong>Sign-in method</strong> para ativar ou desativar provedores (E-mail/Senha, Google, etc.).
+                    </p>
+                    <p>
+                      <strong>3. Acesso de Administrador:</strong> O e-mail <strong className="text-slate-800">propostasrej@gmail.com</strong> tem privilégio total de administrador independente do método escolhido.
+                    </p>
+                  </div>
+                </details>
               </div>
             </div>
           </div>
@@ -10819,7 +12660,31 @@ export default function App() {
                           empreendimentos.length > 0 ? (
                             <select 
                               value={result.property?.empreendimento || ''}
-                              onChange={(e) => updateResult('property', 'empreendimento', e.target.value)}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                updateResult('property', 'empreendimento', val);
+                                const matched = empreendimentos.find(emp => emp.nome === val);
+                                if (matched?.localizacao) {
+                                  const parts = matched.localizacao.includes(' - ') 
+                                    ? matched.localizacao.split(' - ') 
+                                    : matched.localizacao.includes('/') 
+                                      ? matched.localizacao.split('/') 
+                                      : [matched.localizacao, ''];
+                                  setResult(prev => {
+                                    if (!prev) return null;
+                                    return {
+                                      ...prev,
+                                      property: {
+                                        ...prev.property,
+                                        empreendimento: val,
+                                        cidade: parts[0]?.trim() || prev.property?.cidade || '',
+                                        estado: parts[1]?.trim() || prev.property?.estado || '',
+                                        endereco: matched?.endereco || matched?.localizacao || prev.property?.endereco || ''
+                                      }
+                                    };
+                                  });
+                                }
+                              }}
                               className="text-right font-medium border-b border-indigo-200 focus:border-indigo-500 outline-none bg-transparent"
                             >
                               <option value="">Selecione...</option>
@@ -10876,6 +12741,48 @@ export default function App() {
                           />
                         ) : (
                           <span className="font-medium">{result.property?.torre || '-'}</span>
+                        )}
+                      </div>
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-slate-400">Município/UF (Imóvel)</span>
+                        {isEditing ? (
+                          <div className="flex gap-2 justify-end">
+                            <input 
+                              type="text" 
+                              value={result.property?.cidade || ''}
+                              onChange={(e) => updateResult('property', 'cidade', e.target.value)}
+                              placeholder="Município do Imóvel"
+                              className="text-right font-medium border-b border-indigo-200 focus:border-indigo-500 outline-none bg-transparent w-36"
+                            />
+                            <input 
+                              type="text" 
+                              value={result.property?.estado || ''}
+                              onChange={(e) => updateResult('property', 'estado', e.target.value.toUpperCase())}
+                              placeholder="UF"
+                              maxLength={2}
+                              className="text-right font-medium border-b border-indigo-200 focus:border-indigo-500 outline-none bg-transparent w-10 uppercase"
+                            />
+                          </div>
+                        ) : (
+                          <span className="font-medium text-slate-800">
+                            {getLocalImovel(result.property, result.address, empreendimentos)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-slate-400">Endereço (Empreendimento)</span>
+                        {isEditing ? (
+                          <input 
+                            type="text" 
+                            value={result.property?.endereco || ''}
+                            onChange={(e) => updateResult('property', 'endereco', e.target.value)}
+                            placeholder={getEnderecoEmpreendimento(result.property, empreendimentos)}
+                            className="text-right font-medium border-b border-indigo-200 focus:border-indigo-500 outline-none bg-transparent w-64 placeholder:text-slate-300"
+                          />
+                        ) : (
+                          <span className="font-medium text-slate-800 text-right max-w-[280px] truncate" title={getEnderecoEmpreendimento(result.property, empreendimentos)}>
+                            {getEnderecoEmpreendimento(result.property, empreendimentos)}
+                          </span>
                         )}
                       </div>
                       <div className="flex justify-between items-center text-sm pt-2 border-t border-slate-100 mt-2">
@@ -11465,13 +13372,13 @@ export default function App() {
                           IMPRIMIR PROPOSTA
                         </button>
 
-                        {/* 7. Imprimir Contrato */}
+                        {/* 7. Baixar Contrato em PDF */}
                         <button 
-                          onClick={() => printContract(result)}
+                          onClick={() => downloadContractPDF(result)}
                           className="w-full flex items-center gap-2.5 justify-start text-xs font-bold py-2.5 px-3 bg-teal-50 text-teal-700 hover:bg-teal-100/70 border border-teal-100 rounded-xl transition-all shadow-sm"
                         >
-                          <Printer className="w-4 h-4 text-teal-500" />
-                          IMPRIMIR CONTRATO
+                          <Download className="w-4 h-4 text-teal-500" />
+                          BAIXAR CONTRATO EM PDF
                         </button>
 
                         {/* Divider for integrations */}
@@ -11670,6 +13577,19 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-4">
                       <button 
+                        onClick={() => exportRateioToWebropay(waterfallResult)}
+                        disabled={!simulationResult || isExportingWebropay}
+                        className="flex items-center gap-2 px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-bold transition-all active:scale-[0.98] disabled:opacity-50"
+                        title="Gerar Planilha Webropay (.xlsx) com abas Beneficiários e Pagador"
+                      >
+                        {isExportingWebropay ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                        )}
+                        {isExportingWebropay ? 'GERANDO...' : 'PLANILHA WEBROPAY'}
+                      </button>
+                      <button 
                         onClick={() => printDetailedFlow(simulationResult)}
                         disabled={!simulationResult || isSimulating}
                         className="flex items-center gap-2 px-3 py-2 bg-slate-100 text-slate-600 rounded-xl text-xs font-bold hover:bg-slate-200 transition-all active:scale-[0.98] disabled:opacity-50"
@@ -11749,6 +13669,7 @@ export default function App() {
                                   nome: result.property.empreendimento || '',
                                   construtora: (result.property as any).construtora || '',
                                   localizacao: result.address?.cidade ? `${result.address.cidade} - ${result.address.estado || ''}` : '',
+                                  endereco: result.property.endereco || '',
                                   tabela_base_id: '',
                                   status: 'ATIVO',
                                   regras_comissao: [],
@@ -12068,6 +13989,20 @@ export default function App() {
                                     </tr>
                                   ))}
                                 </tbody>
+                                <tfoot>
+                                  <tr className="bg-slate-50 font-bold border-t border-slate-200">
+                                    <td colSpan={2} className="py-2.5 px-3 text-right text-slate-700">TOTAL GERAL:</td>
+                                    <td className="py-2.5 px-3 text-right text-slate-800">
+                                      {sim.fluxo.reduce((acc, p) => acc + p.valorTotal, 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                    </td>
+                                    <td className="py-2.5 px-3 text-right font-bold text-indigo-700">
+                                      {sim.fluxo.reduce((acc, p) => acc + p.valorLiquido, 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                    </td>
+                                    <td className="py-2.5 px-3 text-right font-bold text-amber-700">
+                                      {sim.fluxo.reduce((acc, p) => acc + (p.valorTotal - p.valorLiquido), 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                    </td>
+                                  </tr>
+                                </tfoot>
                               </table>
                             </div>
                           </div>
@@ -12221,143 +14156,302 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Signers list editor */}
+                    {/* Signers list editor - Contrato de Corretagem */}
                     <div className="space-y-3">
-                      <div className="flex items-center justify-between pl-1">
-                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                          2. Definir Signatários (Quem Assina)
-                        </label>
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pl-1">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <label className="block text-[11px] font-bold text-slate-700 uppercase tracking-wider">
+                              2. Tabela de Signatários (Quem Assina)
+                            </label>
+                            <span className="text-[10px] font-bold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full border border-indigo-200">
+                              {editingSigners.length} {editingSigners.length === 1 ? 'signatário' : 'signatários'}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-slate-400 mt-0.5">
+                            Assinaturas do Contrato de Corretagem: Contratantes, Imobiliária Contratada, Corretores Associados e Testemunhas.
+                          </p>
+                        </div>
 
-                        <button
-                          type="button"
-                          onClick={() => setShowAddSignerRow(!showAddSignerRow)}
-                          className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                          Adicionar Signatário
-                        </button>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={handleSyncContractSigners}
+                            title="Sincronizar automaticamente com as partes e testemunhas do Contrato de Corretagem"
+                            className="text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-white hover:bg-indigo-50/50 border border-slate-200 hover:border-indigo-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-all shadow-2xs"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5 text-indigo-500" />
+                            <span>Sincronizar com Contrato</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setShowAddSignerRow(!showAddSignerRow)}
+                            className="text-[11px] font-bold text-white bg-indigo-600 hover:bg-indigo-700 px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-all shadow-sm"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Adicionar</span>
+                          </button>
+                        </div>
                       </div>
 
                       {/* Add Signer Row Form */}
                       {showAddSignerRow && (
-                        <div className="p-3 border border-dashed border-indigo-200 bg-indigo-50/10 rounded-xl grid grid-cols-1 sm:grid-cols-4 gap-2 text-xs">
-                          <input
-                            type="text"
-                            placeholder="Nome Completo"
-                            value={newSignerForm.name}
-                            onChange={(e) => setNewSignerForm({ ...newSignerForm, name: e.target.value })}
-                            className="p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500"
-                          />
-                          <input
-                            type="email"
-                            placeholder="E-mail"
-                            value={newSignerForm.email}
-                            onChange={(e) => setNewSignerForm({ ...newSignerForm, email: e.target.value })}
-                            className="p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500"
-                          />
-                          <input
-                            type="text"
-                            placeholder="CPF (apenas números)"
-                            value={newSignerForm.cpf}
-                            onChange={(e) => setNewSignerForm({ ...newSignerForm, cpf: e.target.value })}
-                            className="p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500"
-                          />
-                          <div className="flex gap-2">
-                            <select
-                              value={newSignerForm.role}
-                              onChange={(e) => setNewSignerForm({ ...newSignerForm, role: e.target.value })}
-                              className="p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500 flex-1"
-                            >
-                              <option value="Contratante">Contratante / Cliente</option>
-                              <option value="Corretor">Corretor Intermediador</option>
-                              <option value="Testemunha">Testemunha</option>
-                              <option value="Outro">Outro Representante</option>
-                            </select>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (!newSignerForm.name || !newSignerForm.email) {
-                                  showToast("Preencha ao menos Nome e E-mail do signatário", "error");
-                                  return;
-                                }
-                                setEditingSigners([...editingSigners, newSignerForm]);
-                                setNewSignerForm({ name: '', email: '', cpf: '', role: 'Testemunha' });
-                                setShowAddSignerRow(false);
-                                showToast("Signatário adicionado!", "success");
-                              }}
-                              className="bg-indigo-600 text-white font-bold p-2.5 rounded-lg hover:bg-indigo-700 transition-all shadow-sm"
-                            >
-                              OK
-                            </button>
+                        <div className="p-3.5 border border-indigo-200 bg-indigo-50/20 rounded-xl grid grid-cols-1 sm:grid-cols-4 gap-2.5 text-xs shadow-2xs">
+                          <div>
+                            <label className="block text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-1">Nome Completo</label>
+                            <input
+                              type="text"
+                              placeholder="Nome do signatário"
+                              value={newSignerForm.name}
+                              onChange={(e) => setNewSignerForm({ ...newSignerForm, name: e.target.value })}
+                              className="w-full p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500 text-xs text-slate-800"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-1">E-mail (Assinatura Eletrônica)</label>
+                            <input
+                              type="email"
+                              placeholder="email@exemplo.com"
+                              value={newSignerForm.email}
+                              onChange={(e) => setNewSignerForm({ ...newSignerForm, email: e.target.value })}
+                              className="w-full p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500 text-xs text-slate-800"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-1">CPF / CNPJ</label>
+                            <input
+                              type="text"
+                              placeholder="000.000.000-00"
+                              value={newSignerForm.cpf}
+                              onChange={(e) => setNewSignerForm({ ...newSignerForm, cpf: e.target.value })}
+                              className="w-full p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500 text-xs font-mono text-slate-800"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-1">Papel no Contrato</label>
+                            <div className="flex gap-2">
+                              <select
+                                value={newSignerForm.role}
+                                onChange={(e) => setNewSignerForm({ ...newSignerForm, role: e.target.value })}
+                                className="w-full p-2 border border-slate-200 rounded-lg bg-white outline-none focus:border-indigo-500 text-xs text-slate-800"
+                              >
+                                <option value="Contratante">Contratante / Comprador</option>
+                                <option value="Imobiliária">Imobiliária Contratada</option>
+                                <option value="Corretor">Corretor Associado</option>
+                                <option value="Gerente">Gerente de Vendas</option>
+                                <option value="Diretor">Diretor Comercial</option>
+                                <option value="Coordenador">Coordenador</option>
+                                <option value="Testemunha">Testemunha Instrumentária</option>
+                                <option value="Outro">Outro Representante</option>
+                              </select>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (!newSignerForm.name.trim()) {
+                                    showToast("Informe o Nome Completo do signatário", "error");
+                                    return;
+                                  }
+                                  setEditingSigners([...editingSigners, { ...newSignerForm, name: newSignerForm.name.trim() }]);
+                                  setNewSignerForm({ name: '', email: '', cpf: '', role: 'Testemunha' });
+                                  setShowAddSignerRow(false);
+                                  showToast("Signatário adicionado à lista!", "success");
+                                }}
+                                className="bg-indigo-600 text-white font-bold px-3 py-2 rounded-lg hover:bg-indigo-700 transition-all shrink-0"
+                              >
+                                OK
+                              </button>
+                            </div>
                           </div>
                         </div>
                       )}
 
-                      {/* Display current list */}
-                      <div className="border border-slate-100 rounded-xl overflow-hidden divide-y divide-slate-100 bg-slate-50/30">
+                      {/* Display structured table */}
+                      <div className="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-2xs">
+                        {/* Table Header */}
+                        <div className="hidden sm:grid grid-cols-12 gap-2 px-3.5 py-2 bg-slate-50 border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                          <div className="col-span-1 text-center">#</div>
+                          <div className="col-span-3">Papel no Contrato</div>
+                          <div className="col-span-3">Nome Completo</div>
+                          <div className="col-span-3">E-mail (Assinafy)</div>
+                          <div className="col-span-2 text-right pr-6">CPF / CNPJ</div>
+                        </div>
+
                         {editingSigners.length === 0 ? (
-                          <div className="p-4 text-center text-slate-400 text-xs">Nenhum signatário adicionado.</div>
+                          <div className="p-6 text-center">
+                            <p className="text-slate-400 text-xs mb-2">Nenhum signatário adicionado.</p>
+                            <button
+                              type="button"
+                              onClick={handleSyncContractSigners}
+                              className="text-xs text-indigo-600 font-bold hover:underline"
+                            >
+                              Clique aqui para carregar as assinaturas do Contrato de Corretagem
+                            </button>
+                          </div>
                         ) : (
-                          editingSigners.map((sig, idx) => (
-                            <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between p-3 gap-3 hover:bg-slate-50 transition-all">
-                              <div className="flex items-center gap-3 min-w-[200px]">
-                                <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider shrink-0 ${
-                                  sig.role === 'Contratante' ? 'bg-blue-100 text-blue-700' :
-                                  sig.role === 'Corretor' ? 'bg-emerald-100 text-emerald-700' :
-                                  'bg-amber-100 text-amber-700'
-                                }`}>
-                                  {sig.role}
-                                </span>
-                                <input
-                                  type="text"
-                                  value={sig.name}
-                                  onChange={(e) => {
-                                    const updated = [...editingSigners];
-                                    updated[idx].name = e.target.value;
-                                    setEditingSigners(updated);
-                                  }}
-                                  className="text-xs font-semibold text-slate-800 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-indigo-500 focus:bg-white outline-none px-1 py-0.5 flex-1"
-                                />
-                              </div>
+                          <div className="divide-y divide-slate-100">
+                            {editingSigners.map((sig, idx) => {
+                              const role = (sig.role || '').toLowerCase();
+                              const isContratante = role.includes('contratante') || role.includes('cliente') || role.includes('comprador');
+                              const isImobiliaria = role.includes('imobili') || role.includes('contratada');
+                              const isCorretor = role.includes('corretor');
+                              const isGestao = role.includes('gerente') || role.includes('diretor') || role.includes('coordenador');
+                              const isTestemunha = role.includes('testemunha');
 
-                              <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                                <input
-                                  type="email"
-                                  placeholder="E-mail"
-                                  value={sig.email}
-                                  onChange={(e) => {
-                                    const updated = [...editingSigners];
-                                    updated[idx].email = e.target.value;
-                                    setEditingSigners(updated);
-                                  }}
-                                  className="text-xs text-slate-600 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-indigo-500 focus:bg-white outline-none px-1 py-0.5"
-                                />
-                                <input
-                                  type="text"
-                                  placeholder="CPF"
-                                  value={sig.cpf}
-                                  onChange={(e) => {
-                                    const updated = [...editingSigners];
-                                    updated[idx].cpf = e.target.value;
-                                    setEditingSigners(updated);
-                                  }}
-                                  className="text-xs font-mono text-slate-600 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-indigo-500 focus:bg-white outline-none px-1 py-0.5"
-                                />
-                              </div>
+                              const badgeStyle = isContratante
+                                ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                : isImobiliaria
+                                ? 'bg-purple-50 text-purple-700 border-purple-200'
+                                : isCorretor
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : isGestao
+                                ? 'bg-teal-50 text-teal-700 border-teal-200'
+                                : isTestemunha
+                                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                : 'bg-slate-100 text-slate-700 border-slate-200';
 
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const updated = editingSigners.filter((_, i) => i !== idx);
-                                  setEditingSigners(updated);
-                                  showToast("Signatário removido.", "info");
-                                }}
-                                className="text-slate-400 hover:text-red-600 p-1 rounded-lg hover:bg-red-50 transition-all shrink-0 align-middle self-center"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              const isEmailMissing = !sig.email || !sig.email.trim();
+
+                              return (
+                                <div
+                                  key={idx}
+                                  className="grid grid-cols-1 sm:grid-cols-12 gap-2 px-3.5 py-2.5 items-center hover:bg-slate-50/70 transition-colors"
+                                >
+                                  {/* Col 1: Order */}
+                                  <div className="sm:col-span-1 flex items-center justify-between sm:justify-center">
+                                    <span className="text-[10px] font-mono font-bold text-slate-400">
+                                      #{idx + 1}
+                                    </span>
+                                    <span className="sm:hidden text-[10px] font-semibold text-slate-500">
+                                      {sig.role}
+                                    </span>
+                                  </div>
+
+                                  {/* Col 2: Role selector / badge */}
+                                  <div className="sm:col-span-3 flex items-center gap-1.5">
+                                    <select
+                                      value={sig.role}
+                                      onChange={(e) => {
+                                        const updated = [...editingSigners];
+                                        updated[idx].role = e.target.value;
+                                        setEditingSigners(updated);
+                                      }}
+                                      className={`text-[10px] font-bold px-2 py-1 rounded-md border tracking-wider outline-none cursor-pointer ${badgeStyle}`}
+                                    >
+                                      <option value="Contratante">Contratante / Comprador</option>
+                                      <option value="Imobiliária">Imobiliária Contratada</option>
+                                      <option value="Corretor">Corretor Associado</option>
+                                      <option value="Gerente">Gerente de Vendas</option>
+                                      <option value="Diretor">Diretor Comercial</option>
+                                      <option value="Coordenador">Coordenador</option>
+                                      <option value="Testemunha">Testemunha</option>
+                                      <option value="Outro">Outro Representante</option>
+                                    </select>
+                                  </div>
+
+                                  {/* Col 3: Full Name */}
+                                  <div className="sm:col-span-3">
+                                    <input
+                                      type="text"
+                                      value={sig.name}
+                                      placeholder="Nome do signatário"
+                                      onChange={(e) => {
+                                        const updated = [...editingSigners];
+                                        updated[idx].name = e.target.value;
+                                        setEditingSigners(updated);
+                                      }}
+                                      className="w-full text-xs font-semibold text-slate-800 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-indigo-500 focus:bg-white outline-none px-1.5 py-1 rounded transition-all"
+                                    />
+                                  </div>
+
+                                  {/* Col 4: Email */}
+                                  <div className="sm:col-span-3">
+                                    <div className="relative">
+                                      <input
+                                        type="email"
+                                        placeholder="email@exemplo.com (obrigatório)"
+                                        value={sig.email}
+                                        onChange={(e) => {
+                                          const updated = [...editingSigners];
+                                          updated[idx].email = e.target.value;
+                                          setEditingSigners(updated);
+                                        }}
+                                        className={`w-full text-xs text-slate-700 bg-transparent border-b rounded px-1.5 py-1 outline-none transition-all ${
+                                          isEmailMissing
+                                            ? 'border-amber-300 bg-amber-50/30 text-amber-900 placeholder:text-amber-400'
+                                            : 'border-transparent hover:border-slate-200 focus:border-indigo-500 focus:bg-white'
+                                        }`}
+                                      />
+                                      {isEmailMissing && (
+                                        <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[9px] text-amber-600 font-bold pointer-events-none">
+                                          Pendente
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {/* Col 5: CPF + Action */}
+                                  <div className="sm:col-span-2 flex items-center justify-between gap-1">
+                                    <input
+                                      type="text"
+                                      placeholder="CPF / CNPJ"
+                                      value={sig.cpf}
+                                      onChange={(e) => {
+                                        const updated = [...editingSigners];
+                                        updated[idx].cpf = e.target.value;
+                                        setEditingSigners(updated);
+                                      }}
+                                      className="w-full text-xs font-mono text-slate-600 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-indigo-500 focus:bg-white outline-none px-1.5 py-1 rounded transition-all"
+                                    />
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const updated = editingSigners.filter((_, i) => i !== idx);
+                                        setEditingSigners(updated);
+                                        showToast("Signatário removido.", "info");
+                                      }}
+                                      title="Remover signatário"
+                                      className="text-slate-400 hover:text-red-600 p-1.5 rounded-lg hover:bg-red-50 transition-all shrink-0"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* Table Footer with Summary Breakdown */}
+                        {editingSigners.length > 0 && (
+                          <div className="px-3.5 py-2.5 bg-slate-50/70 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500">
+                            <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                              <span className="font-bold text-slate-600">Composição:</span>
+                              <span className="bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded border border-blue-200">
+                                {editingSigners.filter(s => (s.role || '').toLowerCase().includes('contratante') || (s.role || '').toLowerCase().includes('cliente')).length} Contratante(s)
+                              </span>
+                              <span className="bg-purple-50 text-purple-700 px-1.5 py-0.5 rounded border border-purple-200">
+                                {editingSigners.filter(s => (s.role || '').toLowerCase().includes('imobili')).length} Imobiliária
+                              </span>
+                              <span className="bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded border border-emerald-200">
+                                {editingSigners.filter(s => (s.role || '').toLowerCase().includes('corretor') || (s.role || '').toLowerCase().includes('gerente') || (s.role || '').toLowerCase().includes('diretor') || (s.role || '').toLowerCase().includes('coordenador')).length} Equipe/Corretores
+                              </span>
+                              <span className="bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded border border-amber-200">
+                                {editingSigners.filter(s => (s.role || '').toLowerCase().includes('testemunha')).length} Testemunhas
+                              </span>
                             </div>
-                          ))
+
+                            {editingSigners.some(s => !s.email || !s.email.trim()) && (
+                              <div className="flex items-center gap-1 text-amber-600 font-medium">
+                                <AlertTriangle className="w-3 h-3 shrink-0" />
+                                <span>Preencha os e-mails pendentes para viabilizar o disparo eletrônico.</span>
+                              </div>
+                            )}
+                          </div>
                         )}
                       </div>
                     </div>
@@ -13065,21 +15159,27 @@ export default function App() {
                         <button
                           onClick={() => {
                             const tempResult = {
+                              id: ext.id,
                               property: ext.property,
                               customers: ext.customers || [(ext as any).customer],
                               address: ext.address,
                               payments: ext.payments,
                               validations: ext.validations,
                               salesTeam: ext.sales_team,
-                              commissionedParties: ext.commissioned_parties || []
+                              commissionedParties: ext.commissioned_parties || [],
+                              commissioned_parties: ext.commissioned_parties || [],
+                              forma_pagamento_comissao: ext.forma_pagamento_comissao,
+                              valorTotalProposta: ext.valorTotalProposta,
+                              percentualComissao: (ext as any).percentualComissao,
+                              manual_waterfall: ext.manual_waterfall
                             };
                             // @ts-ignore
-                            printContract(tempResult);
+                            downloadContractPDF(tempResult);
                           }}
-                          title="Imprimir Contrato"
+                          title="Baixar Contrato em PDF"
                           className="p-2 text-slate-400 hover:text-teal-600 hover:bg-teal-50 rounded-lg transition-all"
                         >
-                          <FileText className="w-4 h-4" />
+                          <Download className="w-4 h-4" />
                         </button>
                         <button
                           onClick={() => generateFichaCadastral(ext)}

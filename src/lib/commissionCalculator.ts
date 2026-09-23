@@ -47,16 +47,28 @@ export function processarProposta(
   percentualComissao: number,
   regras?: RegraComissao[],
   typeConfigs?: InstallmentTypeConfig[],
-  formaPagamento?: string
+  formaPagamento?: string,
+  valorTotalProposta?: number
 ): CommissionResult {
   const percentual = percentualComissao / 100;
   const protegidasBase = ["financiamento", "fgts", "subsídio", "bancário", "instituição", "inadimplemento", "bonus repasse", "adimplimento"];
   
   // 1. Cálculo da Comissão Total - Parcelas do tipo Bonus Repasse e Bônus Adimplimento/Inadimplemento não integram a base de cálculo
-  const valorVenda = parcelas
-    .filter(p => !isExcludedFromCommissionBase(p.tipo))
-    .reduce((acc, p) => acc + (p.valorTotal || 0), 0);
-  const comissaoTotal = valorVenda * percentual;
+  const sumExcluded = parcelas
+    .filter(p => isExcludedFromCommissionBase(p.tipo))
+    .reduce((acc, p) => acc + (p.valorTotal || (p.quantidade ? p.quantidade * (p.valorUnitario || 0) : p.valorUnitario) || 0), 0);
+
+  const sumAllParcelas = parcelas.reduce(
+    (acc, p) => acc + (p.valorTotal || (p.quantidade ? p.quantidade * (p.valorUnitario || 0) : p.valorUnitario) || 0),
+    0
+  );
+
+  // A base da comissão na Simulação de Fluxo Líquido deve corresponder exatamente ao resultado do valor calculado
+  // das parcelas da proposta (ou valorTotalProposta se não houver parcelas cadastradas), subtraídas as exclusões.
+  const baseCalculada = sumAllParcelas > 0 ? sumAllParcelas : (valorTotalProposta && valorTotalProposta > 0 ? valorTotalProposta : 0);
+  const baseVendaTotal = Math.max(0, Number((baseCalculada - sumExcluded).toFixed(2)));
+
+  const comissaoTotal = Number((baseVendaTotal * percentual).toFixed(2));
   
   // Se o pagamento for por NOTA (NF/REPASSE), não deduzimos as parcelas.
   // O valor líquido das parcelas será igual ao bruto.
@@ -112,56 +124,68 @@ export function processarProposta(
       else if (tipoLower.includes('trimestral') || tipoLower.includes('trimetral')) monthsIncrease = 3;
     }
 
-    for (let i = 0; i < qty; i++) {
-      let vencimento = p.vencimento;
-      
-      // Incrementar mês se qty > 1
-      if (i > 0 && p.vencimento) {
-        const originalDate = parseDate(p.vencimento);
-        if (!isNaN(originalDate.getTime()) && originalDate.getTime() < 8640000000000000) {
-          const originalDay = originalDate.getDate();
-          const startMonth = originalDate.getMonth();
-          const startYear = originalDate.getFullYear();
-          
-          const totalMonths = startMonth + (i * monthsIncrease);
-          const targetYear = startYear + Math.floor(totalMonths / 12);
-          const targetMonth = totalMonths % 12;
-          
-          // Obter número máximo de dias no mês/ano de destino
-          const daysInTargetMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
-          
-          const isLeapYear = (year: number) => (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
-          
-          let targetDay = originalDay;
-          if (targetMonth === 1) { // Fevereiro
-            if (isLeapYear(targetYear)) {
-              // Em ano bissexto, limitamos ao dia 29
-              targetDay = Math.min(originalDay, 29);
-            } else {
-              // Em ano comum, limitamos ao dia 28
-              targetDay = Math.min(originalDay, 28);
-            }
-          } else {
-            // Em outros meses, manter o dia da parcela inicial (limitado apenas se o mês tiver menos dias, ex: dia 31 em abril limita a 30)
-            targetDay = Math.min(originalDay, daysInTargetMonth);
-          }
-          
-          const targetDate = new Date(targetYear, targetMonth, targetDay);
-          const day = String(targetDate.getDate()).padStart(2, '0');
-          const month = String(targetDate.getMonth() + 1).padStart(2, '0');
-          const year = targetDate.getFullYear();
-          vencimento = `${day}/${month}/${year}`;
-        }
-      }
+      const valorTotalLinha = p.valorTotal || (p.quantidade ? p.quantidade * (p.valorUnitario || 0) : p.valorUnitario) || 0;
+      const valorUnitarioCalculado = qty > 0 ? Number((valorTotalLinha / qty).toFixed(2)) : 0;
+      let somaUnidadesLinha = 0;
 
-      flattened.push({
-        ...p,
-        quantidade: 1,
-        vencimento,
-        valorTotal: p.valorUnitario 
-      });
-    }
-  });
+      for (let i = 0; i < qty; i++) {
+        let vencimento = p.vencimento;
+        
+        // Incrementar mês se qty > 1
+        if (i > 0 && p.vencimento) {
+          const originalDate = parseDate(p.vencimento);
+          if (!isNaN(originalDate.getTime()) && originalDate.getTime() < 8640000000000000) {
+            const originalDay = originalDate.getDate();
+            const startMonth = originalDate.getMonth();
+            const startYear = originalDate.getFullYear();
+            
+            const totalMonths = startMonth + (i * monthsIncrease);
+            const targetYear = startYear + Math.floor(totalMonths / 12);
+            const targetMonth = totalMonths % 12;
+            
+            // Obter número máximo de dias no mês/ano de destino
+            const daysInTargetMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
+            
+            const isLeapYear = (year: number) => (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+            
+            let targetDay = originalDay;
+            if (targetMonth === 1) { // Fevereiro
+              if (isLeapYear(targetYear)) {
+                // Em ano bissexto, limitamos ao dia 29
+                targetDay = Math.min(originalDay, 29);
+              } else {
+                // Em ano comum, limitamos ao dia 28
+                targetDay = Math.min(originalDay, 28);
+              }
+            } else {
+              // Em outros meses, manter o dia da parcela inicial (limitado apenas se o mês tiver menos dias, ex: dia 31 em abril limita a 30)
+              targetDay = Math.min(originalDay, daysInTargetMonth);
+            }
+            
+            const targetDate = new Date(targetYear, targetMonth, targetDay);
+            const day = String(targetDate.getDate()).padStart(2, '0');
+            const month = String(targetDate.getMonth() + 1).padStart(2, '0');
+            const year = targetDate.getFullYear();
+            vencimento = `${day}/${month}/${year}`;
+          }
+        }
+
+        let valorItem = valorUnitarioCalculado;
+        if (i === qty - 1) {
+          valorItem = Number((valorTotalLinha - somaUnidadesLinha).toFixed(2));
+        } else {
+          somaUnidadesLinha = Number((somaUnidadesLinha + valorItem).toFixed(2));
+        }
+
+        flattened.push({
+          ...p,
+          quantidade: 1,
+          vencimento,
+          valorUnitario: valorItem,
+          valorTotal: valorItem
+        });
+      }
+    });
 
   // 4. Ordenação Cronológica
   const parcelasOrdenadas = flattened.sort((a, b) => 
@@ -171,7 +195,7 @@ export function processarProposta(
   // 5. Simulação de Fluxo
   const fluxo = parcelasOrdenadas.map(p => {
     const nomeClean = (p.tipo || "").toLowerCase();
-    const valorOriginal = p.valorTotal || 0;
+    const valorOriginal = Number((p.valorTotal || 0).toFixed(2));
     let tipoFluxo: 'PROTEGIDA' | 'ELEGÍVEL' = 'ELEGÍVEL';
     let valorLiquido = valorOriginal;
 
@@ -184,15 +208,16 @@ export function processarProposta(
       tipoFluxo = "ELEGÍVEL";
       let limiteDeducao = 0;
       if (regraMatch.tipo_deducao === 'PERCENTUAL') {
-        limiteDeducao = (valorOriginal * regraMatch.valor_deducao) / 100;
+        limiteDeducao = Number(((valorOriginal * regraMatch.valor_deducao) / 100).toFixed(2));
       } else {
-        limiteDeducao = regraMatch.valor_deducao;
+        limiteDeducao = Number((regraMatch.valor_deducao || 0).toFixed(2));
       }
 
       if (saldoComissao > 0) {
-        const deducaoEfetiva = Math.min(valorOriginal, limiteDeducao, saldoComissao);
-        valorLiquido = valorOriginal - deducaoEfetiva;
-        saldoComissao -= deducaoEfetiva;
+        const deducaoEfetiva = Number(Math.min(valorOriginal, limiteDeducao, saldoComissao).toFixed(2));
+        valorLiquido = Number((valorOriginal - deducaoEfetiva).toFixed(2));
+        saldoComissao = Number((saldoComissao - deducaoEfetiva).toFixed(2));
+        if (saldoComissao < 0.005) saldoComissao = 0;
       }
     } else if (protegidasBase.some(ref => nomeClean.includes(ref)) || isExcludedFromCommissionBase(nomeClean)) {
       tipoFluxo = "PROTEGIDA";
@@ -201,9 +226,10 @@ export function processarProposta(
       // Logic for fallback: if no rule and not protected, it's 100% eligible
       tipoFluxo = "ELEGÍVEL";
       if (saldoComissao > 0) {
-        const deducao = Math.min(valorOriginal, saldoComissao);
-        valorLiquido = valorOriginal - deducao;
-        saldoComissao -= deducao;
+        const deducao = Number(Math.min(valorOriginal, saldoComissao).toFixed(2));
+        valorLiquido = Number((valorOriginal - deducao).toFixed(2));
+        saldoComissao = Number((saldoComissao - deducao).toFixed(2));
+        if (saldoComissao < 0.005) saldoComissao = 0;
       }
     }
 
@@ -282,7 +308,7 @@ export function extrairCondicaoPagamentoDoFluxo(
     if (
       grupoAtual &&
       grupoAtual.tipo.trim().toLowerCase() === item.tipo.trim().toLowerCase() &&
-      Math.abs(grupoAtual.valorUnitario - item.valor) < 0.01
+      Math.abs(grupoAtual.valorUnitario - item.valor) < 0.02
     ) {
       grupoAtual.quantidade += 1;
       grupoAtual.vencimentoFinal = item.vencimento;

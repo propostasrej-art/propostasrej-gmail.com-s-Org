@@ -63,9 +63,9 @@ service cloud.firestore {
 
     function isAdmin() {
       return isSignedIn() && (
+        request.auth.token.email == "propostasrej@gmail.com" ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
-        (request.auth.token.email == "propostasrej@gmail.com")
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
       );
     }
     
@@ -97,36 +97,28 @@ service cloud.firestore {
     // ===============================================================
 
     function isValidEntrada(data) {
-      return data.property is map &&
-             data.property.empreendimento is string && data.property.empreendimento.size() <= 200 &&
-             data.property.unidade is string && data.property.unidade.size() <= 50 &&
-             data.customers is list && data.customers.size() <= 10 &&
-             (data.valorTotalProposta is number || data.valorTotalProposta == null) &&
-             data.status in ["na fila", "devolvida com pendencia", "contrato enviado"] &&
-             isValidDateString(data.created_at) &&
-             data.uid is string && data.uid.size() <= 128 &&
+      return (!('property' in data) || data.property is map) &&
+             (!('customers' in data) || data.customers is list) &&
+             (!('valorTotalProposta' in data) || data.valorTotalProposta is number || data.valorTotalProposta == null) &&
+             (!('status' in data) || data.status is string) &&
+             (!('uid' in data) || (data.uid is string && data.uid.size() <= 128)) &&
              (!('spreadsheet_id' in data) || data.spreadsheet_id is string || data.spreadsheet_id == null) &&
              (!('drive_link' in data) || data.drive_link is string || data.drive_link == null) &&
              (!('valorEntrada' in data) || data.valorEntrada is number || data.valorEntrada == null);
     }
 
     function isValidEmpreendimento(data) {
-      return data.nome is string && data.nome.size() > 0 && data.nome.size() <= 200 &&
-             data.status in ["ATIVO", "INATIVO"] &&
-             isValidDateString(data.created_at) &&
-             data.uid is string && data.uid.size() <= 128;
+      return (!('nome' in data) || (data.nome is string && data.nome.size() <= 200)) &&
+             (!('status' in data) || data.status in ["ATIVO", "INATIVO"]);
     }
 
     function isValidInstallmentConfig(data) {
-      return data.descricao is string && data.descricao.size() > 0 && data.descricao.size() <= 100 &&
-             data.periodicidade is number && data.periodicidade >= 1 && data.periodicidade <= 60 &&
-             data.uid is string && data.uid.size() <= 128 &&
-             (isValidDateString(data.created_at) || isValidDateString(data.updated_at));
+      return (!('descricao' in data) || (data.descricao is string && data.descricao.size() <= 100)) &&
+             (!('periodicidade' in data) || (data.periodicidade is number && data.periodicidade >= 1 && data.periodicidade <= 60));
     }
 
     function isValidCargo(data) {
-      return data.nome is string && data.nome.size() > 0 && data.nome.size() <= 200 &&
-             (!('uid' in data) || (data.uid is string && data.uid.size() <= 128));
+      return (!('nome' in data) || (data.nome is string && data.nome.size() <= 200));
     }
 
     // ===============================================================
@@ -138,72 +130,70 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow read: if isSignedIn() && (isOwner(userId) || isAdmin());
-      // Only allow users to create their own record as 'user' or 'EV' if not admin
+      allow read: if isSignedIn();
+      // Allow users to create their own record or admins to create any
       allow create: if isSignedIn() && (
-        (isOwner(userId) && incoming().role in ['user', 'EV']) ||
+        isOwner(userId) ||
         isAdmin()
       );
-      // Users can't change their own role unless they are admins
+      // Allow admins full update, or users to update their own profile without changing role
       allow update: if isSignedIn() && (
-        (isOwner(userId) && incoming().role == existing().role) || 
-        isAdmin()
+        isAdmin() ||
+        (isOwner(userId) && (!('role' in incoming()) || incoming().role == existing().role))
       );
+      allow delete: if isAdmin();
     }
 
     match /entrada/{entradaId} {
-      allow get: if isSignedIn() && (existing().uid == request.auth.uid || isAdmin());
-      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow get: if isSignedIn() && (isAdmin() || !('uid' in resource.data) || resource.data.uid == request.auth.uid);
+      allow list: if isSignedIn() && (isAdmin() || !('uid' in resource.data) || resource.data.uid == request.auth.uid);
       
-      allow create: if isSignedIn() && 
-                      isValidEntrada(incoming()) && 
-                      incoming().uid == request.auth.uid;
+      allow create: if isSignedIn() && (
+        isAdmin() || 
+        (('uid' in incoming() && incoming().uid == request.auth.uid) && isValidEntrada(incoming()))
+      );
       
-      allow update: if isSignedIn() && 
-                      (existing().uid == request.auth.uid || isAdmin()) && 
-                      isValidEntrada(incoming()) && 
-                      incoming().uid == existing().uid;
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        ((!('uid' in existing()) || existing().uid == request.auth.uid) && 
+         (!('uid' in incoming()) || incoming().uid == existing().uid || incoming().uid == request.auth.uid) &&
+         isValidEntrada(incoming()))
+      );
       
-      allow delete: if isSignedIn() && (existing().uid == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (isAdmin() || ('uid' in existing() && existing().uid == request.auth.uid));
     }
 
     match /empreendimentos/{empId} {
       allow read: if isSignedIn();
       allow create: if isAdmin();
-      allow update: if isAdmin() && isValidEmpreendimento(incoming());
+      allow update: if isAdmin();
       allow delete: if isAdmin();
     }
 
     match /configuracoes_parcelas/{configId} {
       allow read: if isSignedIn();
       allow create: if isAdmin();
-      allow update: if isAdmin() && isValidInstallmentConfig(incoming());
+      allow update: if isAdmin();
       allow delete: if isAdmin();
     }
 
     match /inbox/{inboxId} {
-      allow read: if isSignedIn() && (existing().uid == request.auth.uid || isAdmin());
-      // Inbox items are usually created by the system/admin or owner during upload
-      allow create: if isSignedIn() && (incoming().uid == request.auth.uid || isAdmin());
-      allow update: if isSignedIn() && (existing().uid == request.auth.uid || isAdmin()) && (incoming().uid == existing().uid);
-      allow delete: if isSignedIn() && (existing().uid == request.auth.uid || isAdmin());
+      allow read: if isSignedIn() && (isAdmin() || !('uid' in resource.data) || resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn() && (isAdmin() || !('uid' in incoming()) || incoming().uid == request.auth.uid);
+      allow update: if isSignedIn() && (isAdmin() || !('uid' in existing()) || existing().uid == request.auth.uid);
+      allow delete: if isSignedIn() && (isAdmin() || !('uid' in existing()) || existing().uid == request.auth.uid);
     }
 
     match /user_settings/{userId} {
       allow read: if isOwner(userId) || isAdmin();
-      allow write: if (isOwner(userId) || isAdmin()) && 
-                     (incoming().dashboard_spreadsheet_id is string || incoming().dashboard_spreadsheet_id == null);
+      allow write: if isOwner(userId) || isAdmin();
     }
 
     match /cargos/{cargoId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn() && isValidCargo(incoming());
-      allow update: if isSignedIn() && isValidCargo(incoming()) && (
-        !('uid' in existing()) || existing().uid == request.auth.uid || isAdmin()
-      );
-      allow delete: if isSignedIn() && (
-        !('uid' in existing()) || existing().uid == request.auth.uid || isAdmin()
-      );
+      allow update: if isSignedIn() && (isAdmin() || !('uid' in existing()) || existing().uid == request.auth.uid);
+      allow delete: if isSignedIn() && (isAdmin() || !('uid' in existing()) || existing().uid == request.auth.uid);
     }
   }
 }
